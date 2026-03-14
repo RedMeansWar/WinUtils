@@ -24,6 +24,7 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  *
+
  * ============================================================================
  * LEGAL NOTICE & ETHICAL USE POLICY
  * ============================================================================
@@ -77,8 +78,10 @@
  * Requires : Windows (Win32 API), C++17 or later, WinUtils.hpp
  * Reference: See README.md for full namespace and function documentation
  *
+ * "Just Monika." — DDLC
+ *
  * ============================================================================
-*/
+ */
 
 
 #pragma once
@@ -374,6 +377,127 @@ namespace Ownership {
     inline bool IsElevated() {
         auto il = GetIntegrityLevel();
         return il == IntegrityLevel::High || il == IntegrityLevel::System;
+    }
+
+    // ----------------------------------------------------------
+    //  Permission Reset Utilities
+    // ----------------------------------------------------------
+
+    /// Reset a file or folder's permissions back to Windows defaults.
+    /// Uses icacls to restore inherited permissions and remove explicit ACEs.
+    /// Useful for fixing permission problems caused by other tools/malware.
+    inline bool ResetFilePermissions(const std::string& path, bool recursive = false) {
+        std::string cmd = "icacls \"" + path + "\" /reset";
+        if (recursive) cmd += " /T /C";
+        auto result = Process::RunCapture("cmd.exe /c " + cmd);
+        return result.has_value();
+    }
+
+    /// Reset permissions on a path back to inherited from parent.
+    /// Removes all explicit ACEs and re-enables inheritance.
+    inline bool RestoreInheritedPermissions(const std::string& path) {
+        // Enable inheritance and remove explicit ACEs
+        PACL pOldDacl = nullptr;
+        PSECURITY_DESCRIPTOR pSD = nullptr;
+        std::wstring wpath = Str::ToWide(path);
+
+        if (GetNamedSecurityInfoW(wpath.c_str(), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION, nullptr, nullptr,
+            &pOldDacl, nullptr, &pSD) != ERROR_SUCCESS)
+            return false;
+
+        // NULL DACL with DACL_SECURITY_INFORMATION + unprotected = inherit from parent
+        bool ok = SetNamedSecurityInfoW(
+            const_cast<LPWSTR>(wpath.c_str()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+
+        if (pSD) LocalFree(pSD);
+        return ok;
+    }
+
+    /// Full nuclear reset — take ownership, reset all permissions,
+    /// restore inheritance. The "fix everything" button.
+    /// Useful when a file is completely locked down and inaccessible.
+    /// !! On system files this can break Windows — use carefully !!
+    inline bool NukeAndResetPermissions(const std::string& path,
+                                         bool recursive = false) {
+        _EnablePrivilege(SE_TAKE_OWNERSHIP_NAME);
+        _EnablePrivilege(SE_RESTORE_NAME);
+        _EnablePrivilege(SE_BACKUP_NAME);
+        _EnablePrivilege(SE_SECURITY_NAME);
+
+        // Step 1: Take ownership
+        if (!TakeOwnershipFile(path)) return false;
+
+        // Step 2: Grant ourselves full control so we can change the ACL
+        if (!GrantFullControlFile(path)) return false;
+
+        // Step 3: Reset permissions via icacls
+        if (!ResetFilePermissions(path, recursive)) return false;
+
+        // Step 4: Restore inheritance from parent
+        return RestoreInheritedPermissions(path);
+    }
+
+    /// Reset registry key permissions back to inherited defaults
+    inline bool ResetKeyPermissions(HKEY root, const std::string& subkey) {
+        std::string rootName;
+        if      (root == HKEY_LOCAL_MACHINE)  rootName = "MACHINE";
+        else if (root == HKEY_CURRENT_USER)   rootName = "CURRENT_USER";
+        else if (root == HKEY_CLASSES_ROOT)   rootName = "CLASSES_ROOT";
+        else if (root == HKEY_USERS)          rootName = "USERS";
+        else return false;
+
+        std::string fullKey = rootName + "\\" + subkey;
+        return SetNamedSecurityInfoW(
+            const_cast<LPWSTR>(Str::ToWide(fullKey).c_str()),
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+    }
+
+    /// Get a human-readable description of the current privilege level
+    /// including all levels above standard user
+    inline std::string GetPrivilegeLevelDescription() {
+        // Check if we are TrustedInstaller
+        // (requires checking token username rather than integrity level
+        //  since TI runs at high integrity but with special group membership)
+        HANDLE hToken = nullptr;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken);
+        if (hToken) {
+            DWORD sz = 0;
+            GetTokenInformation(hToken, TokenUser, nullptr, 0, &sz);
+            std::vector<BYTE> buf(sz);
+            GetTokenInformation(hToken, TokenUser, buf.data(), sz, &sz);
+            PSID pSid = reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid;
+            wchar_t name[256]={}, domain[256]={};
+            DWORD ns=256, ds=256; SID_NAME_USE use;
+            LookupAccountSidW(nullptr, pSid, name, &ns, domain, &ds, &use);
+            std::string username = Str::ToNarrow(name);
+            std::transform(username.begin(), username.end(), username.begin(), ::tolower);
+            CloseHandle(hToken);
+            if (username.find("trustedinstaller") != std::string::npos)
+                return "TrustedInstaller (highest usermode — owns OS files)";
+        }
+
+        switch (GetIntegrityLevel()) {
+            case IntegrityLevel::System:
+                return "SYSTEM (can do anything in usermode)";
+            case IntegrityLevel::High:
+                return "Administrator (elevated)";
+            case IntegrityLevel::MediumPlus:
+                return "Medium+ (partial elevation)";
+            case IntegrityLevel::Medium:
+                return "Standard User";
+            case IntegrityLevel::Low:
+                return "Low integrity (sandboxed)";
+            case IntegrityLevel::Untrusted:
+                return "Untrusted (most restricted)";
+            default:
+                return "Unknown";
+        }
     }
 
 } // namespace Ownership
@@ -966,6 +1090,142 @@ namespace Token {
         return isSystem;
     }
 
+    // ----------------------------------------------------------
+    //  TrustedInstaller Token
+    // ----------------------------------------------------------
+    //
+    //  !! PROOF OF CONCEPT — EDUCATIONAL PURPOSES !!
+    //
+    //  TrustedInstaller is a Windows service whose token is the
+    //  most privileged in usermode Windows. It owns core OS files
+    //  in C:\Windows\System32, C:\Windows\WinSxS, and more.
+    //  Even SYSTEM cannot modify TrustedInstaller-owned files
+    //  without first taking ownership or impersonating this token.
+    //
+    //  This is NOT a vulnerability. It is the intended Windows
+    //  security model working as designed — this token is obtained
+    //  through legitimate Win32 API calls by any process already
+    //  running as SYSTEM. The purpose of this code is to demonstrate
+    //  how Windows privilege levels actually work and why
+    //  TrustedInstaller ownership exists as a security boundary.
+    //
+    //  Practical uses:
+    //    - Modifying/replacing protected OS files (patching, modding)
+    //    - Understanding Windows security internals
+    //    - Security research on OS file protection mechanisms
+    //    - Deleting stubborn system files that resist even Admin access
+    //
+    //  !! DO NOT use this to tamper with OS files on systems you
+    //     do not own. Modifying the wrong file can make Windows
+    //     completely unbootable with no recovery path. !!
+    //
+    // ----------------------------------------------------------
+
+    /// Get the TrustedInstaller service token.
+    /// This is the highest privilege token available in Windows usermode.
+    ///
+    /// How it works:
+    ///   1. Elevate to SYSTEM via winlogon.exe token steal
+    ///   2. Start the TrustedInstaller service (usually stopped)
+    ///   3. Wait for TrustedInstaller.exe to appear as a process
+    ///   4. Steal its token — this token can modify any file on the system
+    ///
+    /// Requires: Administrator + must already be running as or able to
+    ///           impersonate SYSTEM (call GetSystemToken() first if needed)
+    ///
+    /// Returns token handle or nullptr on failure.
+    /// Caller must CloseHandle() when done.
+    inline HANDLE GetTrustedInstallerToken() {
+        // Step 1: Make sure we are SYSTEM — TI token requires SYSTEM to steal
+        Ownership::_EnablePrivilege(SE_DEBUG_NAME);
+        Ownership::_EnablePrivilege(SE_IMPERSONATE_NAME);
+
+        // Get SYSTEM token via winlogon if we aren't already SYSTEM
+        HANDLE hSystemToken = StealFromProcessName("winlogon.exe");
+        if (!hSystemToken) return nullptr;
+        ImpersonateLoggedOnUser(hSystemToken);
+        CloseHandle(hSystemToken);
+
+        // Step 2: Start the TrustedInstaller service
+        SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+        if (!hSCM) { RevertToSelf(); return nullptr; }
+
+        SC_HANDLE hSvc = OpenServiceW(hSCM, L"TrustedInstaller",
+            SERVICE_START | SERVICE_QUERY_STATUS);
+        if (!hSvc) { CloseServiceHandle(hSCM); RevertToSelf(); return nullptr; }
+
+        // Start it — ignore error if already running
+        StartServiceW(hSvc, 0, nullptr);
+
+        // Step 3: Wait for TrustedInstaller.exe to appear (up to 5 seconds)
+        DWORD tiPid = 0;
+        for (int attempts = 0; attempts < 50 && tiPid == 0; ++attempts) {
+            ::Sleep(100);
+            SERVICE_STATUS_PROCESS ssp{};
+            DWORD needed = 0;
+            QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+                reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed);
+            if (ssp.dwCurrentState == SERVICE_RUNNING)
+                tiPid = ssp.dwProcessId;
+        }
+
+        CloseServiceHandle(hSvc);
+        CloseServiceHandle(hSCM);
+
+        if (!tiPid) { RevertToSelf(); return nullptr; }
+
+        // Step 4: Steal the TrustedInstaller process token
+        HANDLE hTIToken = StealFromProcess(tiPid);
+        RevertToSelf(); // stop impersonating SYSTEM
+        return hTIToken; // caller owns this handle
+    }
+
+    /// Impersonate TrustedInstaller — run the current thread as TrustedInstaller.
+    /// This gives you write access to any file on the system including
+    /// protected OS files in System32 and WinSxS.
+    ///
+    /// Call RevertImpersonation() when done.
+    /// !! EXTREMELY DANGEROUS — modifying wrong OS files = unbootable Windows !!
+    inline bool ImpersonateTrustedInstaller() {
+        HANDLE hToken = GetTrustedInstallerToken();
+        if (!hToken) return false;
+        bool ok = ImpersonateLoggedOnUser(hToken) != FALSE;
+        CloseHandle(hToken);
+        return ok;
+    }
+
+    /// Launch a process with TrustedInstaller privileges.
+    /// That process will have full access to all OS files.
+    /// !! PROOF OF CONCEPT — use responsibly !!
+    inline bool CreateProcessAsTrustedInstaller(const std::string& exe,
+                                                 const std::string& args = "") {
+        HANDLE hToken = GetTrustedInstallerToken();
+        if (!hToken) return false;
+        bool ok = CreateProcessWithToken(hToken, exe, args);
+        CloseHandle(hToken);
+        return ok;
+    }
+
+    /// Check if a token belongs to TrustedInstaller
+    inline bool IsTrustedInstallerToken(HANDLE hToken) {
+        std::string user = GetTokenUsername(hToken);
+        // TrustedInstaller runs as "NT SERVICE\TrustedInstaller"
+        std::string lower = user;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        return lower.find("trustedinstaller") != std::string::npos;
+    }
+
+    /// Convenience: take ownership of a file as TrustedInstaller.
+    /// This lets you modify any file on the system including core OS files.
+    /// !! Modifying the wrong system file can make Windows unbootable !!
+    inline bool TakeOwnershipAsTrustedInstaller(const std::string& path) {
+        if (!ImpersonateTrustedInstaller()) return false;
+        bool ok = Ownership::TakeOwnershipFile(path);
+        ok = ok && Ownership::GrantFullControlFile(path);
+        RevertToSelf();
+        return ok;
+    }
+
 } // namespace Token
 
 // ============================================================
@@ -1323,11 +1583,9 @@ namespace Inject {
 #ifdef _WIN64
         uintptr_t origRip = ctx.Rip;
         ctx.Rcx = reinterpret_cast<uintptr_t>(pathMem); // arg1
-        // assign the RIP as an integer address of the function
-        ctx.Rip = reinterpret_cast<uintptr_t>(ll);
+        ctx.Rip = static_cast<DWORD64>(reinterpret_cast<uintptr_t>(ll));
 #else
-        // assign the EIP as an integer address of the function
-        ctx.Eip = reinterpret_cast<DWORD>(ll);
+        ctx.Eip = static_cast<DWORD>(reinterpret_cast<uintptr_t>(ll));
         // Push path address onto stack
         ctx.Esp -= sizeof(DWORD);
         DWORD pathAddr = reinterpret_cast<DWORD>(pathMem);

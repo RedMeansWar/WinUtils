@@ -2666,26 +2666,32 @@ namespace FileAttr {
 } // namespace FileAttr
 
 // ============================================================
-//  SECTION 33 — File Encryption (AES-256-CBC via Windows CNG)
+//  SECTION 34 — AES-256-GCM Authenticated Encryption
 // ============================================================
-//  Encrypt and decrypt files using AES-256-CBC via the Windows
-//  Cryptography Next Generation (CNG) API. No external libs.
-//  Keys are derived from a password using SHA-256.
-//  Perfect for protecting game assets, configs, or anti-cheat
-//  files so they can't be read or tampered with at rest.
+//  AES-GCM combines encryption AND authentication in one pass.
+//  Unlike AES-CBC, GCM detects tampering — if anyone modifies
+//  the ciphertext even by a single bit, decryption fails with
+//  an authentication error. This is the preferred mode for
+//  protecting files where integrity matters (game assets,
+//  anti-cheat configs, license files, etc.)
+//
+//  Wire format: [12 byte nonce][16 byte auth tag][ciphertext]
+//  The auth tag guarantees both authenticity and integrity.
+//  Wrong password or tampered file = decryption returns empty.
 // ============================================================
-namespace Encrypt {
-
-    // Internal helpers
-    namespace _enc {
+namespace EncryptGCM {
+ 
+    // Internal helpers shared with Encrypt namespace
+    namespace _gcm {
+ 
+        /// Derive a 32-byte AES-256 key from a password using SHA-256
         inline std::vector<BYTE> DeriveKey(const std::string& password) {
-            // SHA-256 of the password = 32 byte AES-256 key
             BCRYPT_ALG_HANDLE hAlg = nullptr;
             BCRYPT_HASH_HANDLE hHash = nullptr;
             BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-            DWORD hashLen = 32, cbData = 0;
+            DWORD hashLen = 32, cb = 0;
             BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH,
-                reinterpret_cast<PUCHAR>(&hashLen), sizeof(DWORD), &cbData, 0);
+                reinterpret_cast<PUCHAR>(&hashLen), sizeof(DWORD), &cb, 0);
             std::vector<BYTE> key(hashLen);
             BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
             BCryptHashData(hHash,
@@ -2696,8 +2702,8 @@ namespace Encrypt {
             BCryptCloseAlgorithmProvider(hAlg, 0);
             return key;
         }
-
-        // Generate cryptographically random bytes
+ 
+        /// Generate cryptographically secure random bytes
         inline std::vector<BYTE> RandomBytes(DWORD count) {
             std::vector<BYTE> buf(count);
             BCRYPT_ALG_HANDLE hRng = nullptr;
@@ -2706,17 +2712,17 @@ namespace Encrypt {
             BCryptCloseAlgorithmProvider(hRng, 0);
             return buf;
         }
-
+ 
+        /// Import a raw AES key into a CNG key handle
         inline BCRYPT_KEY_HANDLE ImportAESKey(BCRYPT_ALG_HANDLE hAlg,
                                                const std::vector<BYTE>& key) {
-            // Build BCRYPT_KEY_DATA_BLOB
             DWORD blobSz = sizeof(BCRYPT_KEY_DATA_BLOB_HEADER) +
                            static_cast<DWORD>(key.size());
             std::vector<BYTE> blob(blobSz);
-            auto* hdr = reinterpret_cast<BCRYPT_KEY_DATA_BLOB_HEADER*>(blob.data());
-            hdr->dwMagic   = BCRYPT_KEY_DATA_BLOB_MAGIC;
-            hdr->dwVersion = BCRYPT_KEY_DATA_BLOB_VERSION1;
-            hdr->cbKeyData = static_cast<DWORD>(key.size());
+            auto* hdr        = reinterpret_cast<BCRYPT_KEY_DATA_BLOB_HEADER*>(blob.data());
+            hdr->dwMagic     = BCRYPT_KEY_DATA_BLOB_MAGIC;
+            hdr->dwVersion   = BCRYPT_KEY_DATA_BLOB_VERSION1;
+            hdr->cbKeyData   = static_cast<DWORD>(key.size());
             memcpy(blob.data() + sizeof(BCRYPT_KEY_DATA_BLOB_HEADER),
                 key.data(), key.size());
             BCRYPT_KEY_HANDLE hKey = nullptr;
@@ -2725,134 +2731,162 @@ namespace Encrypt {
             return hKey;
         }
     }
-
-    /// Encrypt a block of data with AES-256-CBC using a password.
-    /// Output format: [16 byte IV][encrypted data (padded to 16 byte blocks)]
-    inline std::vector<BYTE> EncryptData(const std::vector<BYTE>& data,
+ 
+    /// Encrypt data using AES-256-GCM.
+    /// Output format: [12 byte nonce][16 byte auth tag][ciphertext]
+    /// The auth tag ensures integrity — any tampering causes decryption to fail.
+    inline std::vector<BYTE> EncryptData(const std::vector<BYTE>& plaintext,
                                           const std::string& password) {
-        auto key = _enc::DeriveKey(password);
-        auto iv  = _enc::RandomBytes(16);
-
+        auto key   = _gcm::DeriveKey(password);
+        auto nonce = _gcm::RandomBytes(12); // 96-bit nonce for GCM
+ 
         BCRYPT_ALG_HANDLE hAlg = nullptr;
         BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
         BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
-            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
-            sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
-
-        BCRYPT_KEY_HANDLE hKey = _enc::ImportAESKey(hAlg, key);
-
-        // Calculate output size with PKCS7 padding
-        DWORD encSz = 0;
-        std::vector<BYTE> ivCopy = iv; // BCryptEncrypt modifies IV in-place
-        BCryptEncrypt(hKey,
-            const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()),
-            nullptr, ivCopy.data(), 16, nullptr, 0, &encSz, BCRYPT_BLOCK_PADDING);
-
-        std::vector<BYTE> encData(encSz);
-        ivCopy = iv;
-        BCryptEncrypt(hKey,
-            const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()),
-            nullptr, ivCopy.data(), 16,
-            encData.data(), encSz, &encSz, BCRYPT_BLOCK_PADDING);
-
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+            sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+ 
+        BCRYPT_KEY_HANDLE hKey = _gcm::ImportAESKey(hAlg, key);
+ 
+        // Set up authenticated encryption info
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+        BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+        std::vector<BYTE> tag(16); // 128-bit authentication tag
+        authInfo.pbNonce     = nonce.data();
+        authInfo.cbNonce     = 12;
+        authInfo.pbTag       = tag.data();
+        authInfo.cbTag       = 16;
+        authInfo.pbAuthData  = nullptr;  // no additional authenticated data
+        authInfo.cbAuthData  = 0;
+ 
+        // Encrypt
+        std::vector<BYTE> ciphertext(plaintext.size());
+        DWORD cipherLen = 0;
+        NTSTATUS status = BCryptEncrypt(hKey,
+            const_cast<PUCHAR>(plaintext.data()),
+            static_cast<ULONG>(plaintext.size()),
+            &authInfo,
+            nullptr, 0,  // GCM doesn't use a separate IV buffer
+            ciphertext.data(),
+            static_cast<ULONG>(ciphertext.size()),
+            &cipherLen, 0);
+ 
         BCryptDestroyKey(hKey);
         BCryptCloseAlgorithmProvider(hAlg, 0);
-
-        // Prepend IV to output
+ 
+        if (!BCRYPT_SUCCESS(status)) return {};
+ 
+        // Pack: nonce (12) + tag (16) + ciphertext
         std::vector<BYTE> result;
-        result.reserve(16 + encSz);
-        result.insert(result.end(), iv.begin(), iv.end());
-        result.insert(result.end(), encData.begin(), encData.begin() + encSz);
+        result.reserve(12 + 16 + cipherLen);
+        result.insert(result.end(), nonce.begin(), nonce.end());
+        result.insert(result.end(), tag.begin(), tag.end());
+        result.insert(result.end(), ciphertext.begin(), ciphertext.begin() + cipherLen);
         return result;
     }
-
-    /// Decrypt data previously encrypted with EncryptData.
-    /// Returns empty vector on failure (wrong password or corrupted data).
+ 
+    /// Decrypt data encrypted with EncryptData (AES-256-GCM).
+    /// Returns empty vector if password is wrong OR if the data was tampered with.
+    /// You cannot tell the difference — both look the same from outside. That's by design.
     inline std::vector<BYTE> DecryptData(const std::vector<BYTE>& data,
                                           const std::string& password) {
-        if (data.size() < 17) return {}; // need at least IV + 1 block
-        auto key = _enc::DeriveKey(password);
-
-        // Extract IV (first 16 bytes)
-        std::vector<BYTE> iv(data.begin(), data.begin() + 16);
-        std::vector<BYTE> enc(data.begin() + 16, data.end());
-
+        // Minimum: 12 (nonce) + 16 (tag) + 1 (at least 1 byte ciphertext)
+        if (data.size() < 29) return {};
+ 
+        auto key = _gcm::DeriveKey(password);
+ 
+        // Unpack header
+        std::vector<BYTE> nonce(data.begin(), data.begin() + 12);
+        std::vector<BYTE> tag(data.begin() + 12, data.begin() + 28);
+        std::vector<BYTE> ciphertext(data.begin() + 28, data.end());
+ 
         BCRYPT_ALG_HANDLE hAlg = nullptr;
         BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
         BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
-            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
-            sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
-
-        BCRYPT_KEY_HANDLE hKey = _enc::ImportAESKey(hAlg, key);
-
-        DWORD decSz = 0;
-        BCryptDecrypt(hKey, enc.data(), static_cast<ULONG>(enc.size()),
-            nullptr, iv.data(), 16, nullptr, 0, &decSz, BCRYPT_BLOCK_PADDING);
-
-        std::vector<BYTE> decData(decSz);
-        NTSTATUS status = BCryptDecrypt(hKey, enc.data(),
-            static_cast<ULONG>(enc.size()),
-            nullptr, iv.data(), 16,
-            decData.data(), decSz, &decSz, BCRYPT_BLOCK_PADDING);
-
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+            sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+ 
+        BCRYPT_KEY_HANDLE hKey = _gcm::ImportAESKey(hAlg, key);
+ 
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+        BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+        authInfo.pbNonce    = nonce.data();
+        authInfo.cbNonce    = 12;
+        authInfo.pbTag      = tag.data();
+        authInfo.cbTag      = 16;
+        authInfo.pbAuthData = nullptr;
+        authInfo.cbAuthData = 0;
+ 
+        std::vector<BYTE> plaintext(ciphertext.size());
+        DWORD plainLen = 0;
+        NTSTATUS status = BCryptDecrypt(hKey,
+            ciphertext.data(),
+            static_cast<ULONG>(ciphertext.size()),
+            &authInfo,
+            nullptr, 0,
+            plaintext.data(),
+            static_cast<ULONG>(plaintext.size()),
+            &plainLen, 0);
+ 
         BCryptDestroyKey(hKey);
         BCryptCloseAlgorithmProvider(hAlg, 0);
-
+ 
+        // STATUS_AUTH_TAG_MISMATCH (0xC000A002) = wrong password or tampered data
         if (!BCRYPT_SUCCESS(status)) return {};
-        decData.resize(decSz);
-        return decData;
+ 
+        plaintext.resize(plainLen);
+        return plaintext;
     }
-
-    /// Encrypt a string and return the result as a Base64-encoded string
-    inline std::string EncryptString(const std::string& text,
+ 
+    /// Encrypt a string, returns Base64-encoded ciphertext
+    inline std::string EncryptString(const std::string& plaintext,
                                       const std::string& password) {
-        std::vector<BYTE> data(text.begin(), text.end());
+        std::vector<BYTE> data(plaintext.begin(), plaintext.end());
         auto enc = EncryptData(data, password);
+        if (enc.empty()) return {};
         return Crypto::Base64Encode(std::string(enc.begin(), enc.end()));
     }
-
-    /// Decrypt a Base64-encoded string previously encrypted with EncryptString
+ 
+    /// Decrypt a Base64-encoded string. Returns empty on wrong password or tampered data.
     inline std::string DecryptString(const std::string& b64cipher,
                                       const std::string& password) {
         auto raw = Crypto::Base64Decode(b64cipher);
         std::vector<BYTE> enc(raw.begin(), raw.end());
         auto dec = DecryptData(enc, password);
+        if (dec.empty()) return {};
         return std::string(dec.begin(), dec.end());
     }
-
-    /// Encrypt a file in-place. Original file is overwritten with encrypted data.
-    /// A ".enc" extension is appended unless you specify a destination path.
-    inline bool EncryptFile(const std::string& filePath,
+ 
+    /// Encrypt a file with AES-256-GCM. Output: path + ".gcm" unless specified.
+    /// Any tampering with the output file will cause decryption to fail.
+    inline bool EncryptFile(const std::string& path,
                              const std::string& password,
                              const std::string& outputPath = "") {
-        auto content = File::ReadAll(filePath);
-        if (!content) return false;
-        std::vector<BYTE> data(content->begin(), content->end());
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        std::vector<BYTE> data(std::istreambuf_iterator<char>(f), {});
         auto enc = EncryptData(data, password);
-        std::string dest = outputPath.empty() ? filePath + ".enc" : outputPath;
-        std::ofstream f(dest, std::ios::binary);
-        if (!f) return false;
-        f.write(reinterpret_cast<const char*>(enc.data()), enc.size());
-        return f.good();
+        if (enc.empty()) return false;
+        std::string dest = outputPath.empty() ? path + ".gcm" : outputPath;
+        std::ofstream out(dest, std::ios::binary);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(enc.data()), enc.size());
+        return out.good();
     }
-
-    /// Decrypt a file previously encrypted with EncryptFile.
-    inline bool DecryptFile(const std::string& encFilePath,
+ 
+    /// Decrypt a .gcm file. Returns false if password is wrong or file was tampered with.
+    inline bool DecryptFile(const std::string& encPath,
                              const std::string& password,
                              const std::string& outputPath = "") {
-        std::ifstream f(encFilePath, std::ios::binary);
+        std::ifstream f(encPath, std::ios::binary);
         if (!f) return false;
-        // Read into a temporary string first to avoid the most-vexing-parse
-        // and then construct a vector<BYTE> from the string bytes.
-        std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        std::vector<BYTE> enc(raw.begin(), raw.end());
+        std::vector<BYTE> enc(std::istreambuf_iterator<char>(f), {});
         auto dec = DecryptData(enc, password);
-        if (dec.empty()) return false;
-        // Strip .enc extension for default output path
+        if (dec.empty()) return false; // wrong password OR tampered
         std::string dest = outputPath;
         if (dest.empty()) {
-            dest = encFilePath;
-            if (dest.size() > 4 && dest.substr(dest.size() - 4) == ".enc")
+            dest = encPath;
+            if (dest.size() > 4 && dest.substr(dest.size() - 4) == ".gcm")
                 dest = dest.substr(0, dest.size() - 4);
             else
                 dest += ".dec";
@@ -2862,9 +2896,8 @@ namespace Encrypt {
         out.write(reinterpret_cast<const char*>(dec.data()), dec.size());
         return out.good();
     }
-
-    /// Encrypt all files in a directory with a given extension
-    /// Returns count of successfully encrypted files
+ 
+    /// Encrypt all files in a directory with AES-256-GCM
     inline int EncryptDirectory(const std::string& dir,
                                   const std::string& password,
                                   const std::string& ext = "") {
@@ -2877,54 +2910,46 @@ namespace Encrypt {
         }
         return count;
     }
-
-    /// Decrypt all .enc files in a directory
+ 
+    /// Decrypt all .gcm files in a directory
     inline int DecryptDirectory(const std::string& dir, const std::string& password) {
         int count = 0;
         std::error_code ec;
         for (auto& entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
             if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != ".enc") continue;
+            if (entry.path().extension() != ".gcm") continue;
             if (DecryptFile(entry.path().string(), password)) ++count;
         }
         return count;
     }
-
-    /// Generate a strong random password of given length
-    inline std::string GeneratePassword(int length = 32) {
-        static const char chars[] =
-            "abcdefghijklmnopqrstuvwxyz"
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "0123456789!@#$%^&*()_+-=[]{}";
-        auto rnd = _enc::RandomBytes(length);
-        std::string result(length, ' ');
-        for (int i = 0; i < length; ++i)
-            result[i] = chars[rnd[i] % (sizeof(chars) - 1)];
-        return result;
-    }
-
-    /// Securely wipe a file before deleting (overwrite with random data 3 passes)
-    inline bool SecureDelete(const std::string& path) {
-        auto size = File::Size(path);
-        if (!size) return false;
-        std::ofstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+ 
+    /// Verify a file's integrity without fully decrypting it.
+    /// Returns true if the password is correct and the file is unmodified.
+    /// Returns false if the password is wrong OR the file was tampered with.
+    inline bool VerifyFile(const std::string& encPath, const std::string& password) {
+        std::ifstream f(encPath, std::ios::binary);
         if (!f) return false;
-        for (int pass = 0; pass < 3; ++pass) {
-            f.seekp(0);
-            auto rnd = _enc::RandomBytes(static_cast<DWORD>(*size));
-            f.write(reinterpret_cast<const char*>(rnd.data()), rnd.size());
-            f.flush();
-        }
-        f.close();
-        return File::Delete(path);
+        std::vector<BYTE> enc(std::istreambuf_iterator<char>(f), {});
+        // DecryptData returns empty on any auth failure
+        return !DecryptData(enc, password).empty();
     }
-
-} // namespace Encrypt
-
+ 
+} // namespace EncryptGCM
+ 
 } // namespace WinUtils
-
+ 
 #endif // WIN_UTILS_HPP
-
+ 
+// ============================================================
+//  QUICK REFERENCE — WinUtils.hpp
+// ============================================================
+//  Str        Dialog        File          Mouse         Keyboard
+//  Clipboard  Process       Window        System        Registry
+//  Notify     Audio         Log           Hotkey        Screen
+//  Net        Crypto        Ini           Console       Progress
+//  Tray       Drive         FileAttr      Encrypt       EncryptGCM
+// ============================================================
+ 
 // ============================================================
 //  QUICK REFERENCE — WinUtils.hpp
 // ============================================================
