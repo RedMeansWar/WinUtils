@@ -5,6 +5,8 @@
 //  NOTE: Link against: user32.lib, shell32.lib, wininet.lib,
 //        gdi32.lib, advapi32.lib, ole32.lib, comdlg32.lib
 // ============================================================
+//  "Just Monika." — DDLC
+// ============================================================
 
 #pragma once
 #ifndef WIN_UTILS_HPP
@@ -26,7 +28,10 @@
 #include <psapi.h>
 #include <winreg.h>
 #include <dwmapi.h>
-#include <playsoundapi.h>
+#include <bcrypt.h>
+#include <shobjidl.h>
+#include <mmsystem.h>
+#include <pthread.h>
 
 // ---- Standard headers ----
 #include <string>
@@ -41,6 +46,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <map>
+#include <winsock.h>
 
 // ---- Pragma comments (auto-link) ----
 #pragma comment(lib, "user32.lib")
@@ -1084,25 +1090,715 @@ namespace Screen {
         return { GetRValue(c), GetGValue(c), GetBValue(c) };
     }
 
+    /// Save a screen region to a .bmp file
+    inline bool SaveBMP(const std::string& path, int x = 0, int y = 0, int w = 0, int h = 0) {
+        if (w == 0) w = GetSystemMetrics(SM_CXSCREEN);
+        if (h == 0) h = GetSystemMetrics(SM_CYSCREEN);
+        HBITMAP hBmp = Capture(x, y, w, h);
+        if (!hBmp) return false;
+        BITMAP bmp{};
+        GetObject(hBmp, sizeof(BITMAP), &bmp);
+        BITMAPFILEHEADER bfh{};
+        BITMAPINFOHEADER bih{};
+        bih.biSize        = sizeof(BITMAPINFOHEADER);
+        bih.biWidth       = bmp.bmWidth;
+        bih.biHeight      = bmp.bmHeight;
+        bih.biPlanes      = 1;
+        bih.biBitCount    = 24;
+        bih.biCompression = BI_RGB;
+        DWORD rowSize     = ((bmp.bmWidth * 3 + 3) & ~3);
+        bih.biSizeImage   = rowSize * bmp.bmHeight;
+        bfh.bfType        = 0x4D42;
+        bfh.bfOffBits     = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+        bfh.bfSize        = bfh.bfOffBits + bih.biSizeImage;
+        std::vector<BYTE> pixels(bih.biSizeImage);
+        HDC hdc = GetDC(nullptr);
+        BITMAPINFO bi{}; bi.bmiHeader = bih;
+        GetDIBits(hdc, hBmp, 0, bmp.bmHeight, pixels.data(), &bi, DIB_RGB_COLORS);
+        ReleaseDC(nullptr, hdc);
+        DeleteObject(hBmp);
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<char*>(&bfh), sizeof(bfh));
+        f.write(reinterpret_cast<char*>(&bih),  sizeof(bih));
+        f.write(reinterpret_cast<char*>(pixels.data()), pixels.size());
+        return f.good();
+    }
+
+    /// Scan screen for the first pixel matching a color within tolerance.
+    /// Returns {x, y} or {-1,-1} if not found.
+    inline std::pair<int,int> FindColor(COLORREF target, int tolerance = 10,
+                                        int x0 = 0, int y0 = 0, int x1 = 0, int y1 = 0) {
+        if (x1 == 0) x1 = GetSystemMetrics(SM_CXSCREEN);
+        if (y1 == 0) y1 = GetSystemMetrics(SM_CYSCREEN);
+        HDC hdc = GetDC(nullptr);
+        int tr = GetRValue(target), tg = GetGValue(target), tb = GetBValue(target);
+        for (int y = y0; y < y1; ++y) {
+            for (int x = x0; x < x1; ++x) {
+                COLORREF c = ::GetPixel(hdc, x, y);
+                if (std::abs((int)GetRValue(c) - tr) <= tolerance &&
+                    std::abs((int)GetGValue(c) - tg) <= tolerance &&
+                    std::abs((int)GetBValue(c) - tb) <= tolerance) {
+                    ReleaseDC(nullptr, hdc);
+                    return { x, y };
+                }
+            }
+        }
+        ReleaseDC(nullptr, hdc);
+        return { -1, -1 };
+    }
+
 } // namespace Screen
+
+// ============================================================
+//  SECTION 16 — Net Utilities
+// ============================================================
+namespace Net {
+
+    /// Perform an HTTP GET request. Returns response body or nullopt on failure.
+    inline std::optional<std::string> HttpGet(const std::string& url, DWORD timeoutMs = 10000) {
+        HINTERNET hInet = InternetOpenW(L"WinUtils/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+        if (!hInet) return std::nullopt;
+        HINTERNET hUrl = InternetOpenUrlW(hInet, Str::ToWide(url).c_str(), nullptr, 0,
+            INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+        if (!hUrl) { InternetCloseHandle(hInet); return std::nullopt; }
+        std::string result;
+        char buf[4096];
+        DWORD bytesRead = 0;
+        while (InternetReadFile(hUrl, buf, sizeof(buf), &bytesRead) && bytesRead)
+            result.append(buf, bytesRead);
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hInet);
+        return result;
+    }
+
+    /// Perform an HTTP POST request with a body. Returns response body or nullopt.
+    inline std::optional<std::string> HttpPost(const std::string& url, const std::string& body,
+                                                const std::string& contentType = "application/x-www-form-urlencoded") {
+        // Parse URL
+        URL_COMPONENTSW uc{};
+        uc.dwStructSize = sizeof(uc);
+        wchar_t host[256] = {}, path[1024] = {};
+        uc.lpszHostName     = host; uc.dwHostNameLength   = 256;
+        uc.lpszUrlPath      = path; uc.dwUrlPathLength    = 1024;
+        std::wstring wurl = Str::ToWide(url);
+        if (!InternetCrackUrlW(wurl.c_str(), 0, 0, &uc)) return std::nullopt;
+        HINTERNET hInet = InternetOpenW(L"WinUtils/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+        if (!hInet) return std::nullopt;
+        HINTERNET hConn = InternetConnectW(hInet, host, uc.nPort, nullptr, nullptr,
+            INTERNET_SERVICE_HTTP, 0, 0);
+        if (!hConn) { InternetCloseHandle(hInet); return std::nullopt; }
+        HINTERNET hReq = HttpOpenRequestW(hConn, L"POST", path, nullptr, nullptr, nullptr,
+            (uc.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_FLAG_SECURE : 0) | INTERNET_FLAG_RELOAD, 0);
+        if (!hReq) { InternetCloseHandle(hConn); InternetCloseHandle(hInet); return std::nullopt; }
+        std::wstring wct = Str::ToWide("Content-Type: " + contentType);
+        HttpAddRequestHeadersW(hReq, wct.c_str(), static_cast<DWORD>(wct.size()), HTTP_ADDREQ_FLAG_ADD);
+        HttpSendRequestW(hReq, nullptr, 0, const_cast<char*>(body.c_str()), static_cast<DWORD>(body.size()));
+        std::string result;
+        char buf[4096]; DWORD bytesRead = 0;
+        while (InternetReadFile(hReq, buf, sizeof(buf), &bytesRead) && bytesRead)
+            result.append(buf, bytesRead);
+        InternetCloseHandle(hReq); InternetCloseHandle(hConn); InternetCloseHandle(hInet);
+        return result;
+    }
+
+    /// Download a file from a URL to a local path. Returns true on success.
+    inline bool DownloadFile(const std::string& url, const std::string& destPath) {
+        auto data = HttpGet(url);
+        if (!data) return false;
+        std::ofstream f(destPath, std::ios::binary);
+        if (!f) return false;
+        f.write(data->data(), data->size());
+        return f.good();
+    }
+
+    /// Get the local machine's primary IPv4 address as a string.
+    inline std::string GetLocalIP() {
+        char hostname[256] = {};
+        if (gethostname(hostname, sizeof(hostname)) != 0) return "127.0.0.1";
+        // Use WinInet approach — no Winsock link required for a basic lookup
+        auto result = Process::RunCapture("powershell -Command \"(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike '*Loopback*'} | Select-Object -First 1).IPAddress\"");
+        if (result) return Str::Trim(*result);
+        return "127.0.0.1";
+    }
+
+    /// Check if there is an active internet connection
+    inline bool IsConnected() {
+        DWORD flags = 0;
+        return InternetGetConnectedState(&flags, 0) != FALSE;
+    }
+
+} // namespace Net
+
+// ============================================================
+//  SECTION 17 — Crypto Utilities
+// ============================================================
+namespace Crypto {
+
+    /// Simple XOR obfuscation (not cryptographically secure, but handy for configs)
+    inline std::string XorObfuscate(const std::string& data, const std::string& key) {
+        std::string result = data;
+        for (size_t i = 0; i < data.size(); ++i)
+            result[i] = data[i] ^ key[i % key.size()];
+        return result;
+    }
+
+    /// Compute SHA-256 hash of a string using Windows CNG. Returns hex string.
+    inline std::string SHA256(const std::string& data) {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        NTSTATUS status;
+        std::string hexResult;
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+            return {};
+        DWORD hashLen = 0, cbData = 0;
+        BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLen), sizeof(DWORD), &cbData, 0);
+        std::vector<BYTE> hashBuf(hashLen);
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+        BCryptHashData(hHash, reinterpret_cast<PUCHAR>(const_cast<char*>(data.c_str())), static_cast<ULONG>(data.size()), 0);
+        BCryptFinishHash(hHash, hashBuf.data(), hashLen, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        char hex[3];
+        for (BYTE b : hashBuf) { std::snprintf(hex, sizeof(hex), "%02x", b); hexResult += hex; }
+        return hexResult;
+    }
+    #pragma comment(lib, "bcrypt.lib")
+
+    /// Compute MD5 hash of a string using Windows CNG. Returns hex string.
+    inline std::string MD5(const std::string& data) {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        std::string hexResult;
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_MD5_ALGORITHM, nullptr, 0) != 0) return {};
+        DWORD hashLen = 0, cbData = 0;
+        BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLen), sizeof(DWORD), &cbData, 0);
+        std::vector<BYTE> hashBuf(hashLen);
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return {};
+        }
+        BCryptHashData(hHash, reinterpret_cast<PUCHAR>(const_cast<char*>(data.c_str())), static_cast<ULONG>(data.size()), 0);
+        BCryptFinishHash(hHash, hashBuf.data(), hashLen, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        char hex[3];
+        for (BYTE b : hashBuf) { std::snprintf(hex, sizeof(hex), "%02x", b); hexResult += hex; }
+        return hexResult;
+    }
+
+    /// Base64 encode a string (no external libs)
+    inline std::string Base64Encode(const std::string& input) {
+        static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        int val = 0, bits = -6;
+        for (unsigned char c : input) {
+            val = (val << 8) + c; bits += 8;
+            while (bits >= 0) { out += table[(val >> bits) & 0x3F]; bits -= 6; }
+        }
+        if (bits > -6) out += table[((val << 8) >> (bits + 8)) & 0x3F];
+        while (out.size() % 4) out += '=';
+        return out;
+    }
+
+    /// Base64 decode a string
+    inline std::string Base64Decode(const std::string& input) {
+        static const int T[256] = {
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+            -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+            -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+        };
+        std::string out; int val = 0, bits = -8;
+        for (unsigned char c : input) {
+            if (T[c] == -1) break;
+            val = (val << 6) + T[c]; bits += 6;
+            if (bits >= 0) { out += static_cast<char>((val >> bits) & 0xFF); bits -= 8; }
+        }
+        return out;
+    }
+
+} // namespace Crypto
+
+// ============================================================
+//  SECTION 18 — INI File Utilities
+// ============================================================
+namespace Ini {
+
+    /// Read a string value from an INI file
+    inline std::string Read(const std::string& file, const std::string& section,
+                            const std::string& key, const std::string& defaultVal = "") {
+        wchar_t buf[1024] = {};
+        GetPrivateProfileStringW(Str::ToWide(section).c_str(), Str::ToWide(key).c_str(),
+            Str::ToWide(defaultVal).c_str(), buf, 1024, Str::ToWide(file).c_str());
+        return Str::ToNarrow(buf);
+    }
+
+    /// Read an integer value from an INI file
+    inline int ReadInt(const std::string& file, const std::string& section,
+                       const std::string& key, int defaultVal = 0) {
+        return static_cast<int>(GetPrivateProfileIntW(Str::ToWide(section).c_str(),
+            Str::ToWide(key).c_str(), defaultVal, Str::ToWide(file).c_str()));
+    }
+
+    /// Write a string value to an INI file
+    inline bool Write(const std::string& file, const std::string& section,
+                      const std::string& key, const std::string& value) {
+        return WritePrivateProfileStringW(Str::ToWide(section).c_str(), Str::ToWide(key).c_str(),
+            Str::ToWide(value).c_str(), Str::ToWide(file).c_str()) != 0;
+    }
+
+    /// Write an integer value to an INI file
+    inline bool WriteInt(const std::string& file, const std::string& section,
+                         const std::string& key, int value) {
+        return Write(file, section, key, std::to_string(value));
+    }
+
+    /// Delete a key from an INI file
+    inline bool DeleteKey(const std::string& file, const std::string& section, const std::string& key) {
+        return WritePrivateProfileStringW(Str::ToWide(section).c_str(), Str::ToWide(key).c_str(),
+            nullptr, Str::ToWide(file).c_str()) != 0;
+    }
+
+    /// Delete an entire section from an INI file
+    inline bool DeleteSection(const std::string& file, const std::string& section) {
+        return WritePrivateProfileStringW(Str::ToWide(section).c_str(), nullptr,
+            nullptr, Str::ToWide(file).c_str()) != 0;
+    }
+
+} // namespace Ini
+
+// ============================================================
+//  SECTION 19 — Console Utilities
+// ============================================================
+namespace Console {
+
+    /// Set console text color. fg/bg are FOREGROUND_*/BACKGROUND_* constants.
+    inline void SetColor(WORD fg = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
+                         WORD bg = 0) {
+        SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), fg | bg);
+    }
+
+    /// Reset console color to default white on black
+    inline void ResetColor() {
+        SetColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    }
+
+    /// Clear the console screen
+    inline void Clear() {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_SCREEN_BUFFER_INFO csbi{};
+        GetConsoleScreenBufferInfo(h, &csbi);
+        DWORD size = csbi.dwSize.X * csbi.dwSize.Y;
+        DWORD written = 0;
+        COORD origin = { 0, 0 };
+        FillConsoleOutputCharacterW(h, L' ', size, origin, &written);
+        FillConsoleOutputAttribute(h, csbi.wAttributes, size, origin, &written);
+        SetConsoleCursorPosition(h, origin);
+    }
+
+    /// Set the console window title
+    inline void SetTitle(const std::string& title) {
+        SetConsoleTitleW(Str::ToWide(title).c_str());
+    }
+
+    /// Move the console cursor to (x, y)
+    inline void SetCursorPos(SHORT x, SHORT y) {
+        SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), { x, y });
+    }
+
+    /// Show or hide the console cursor
+    inline void ShowCursor(bool visible) {
+        CONSOLE_CURSOR_INFO cci{};
+        GetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), &cci);
+        cci.bVisible = visible;
+        SetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), &cci);
+    }
+
+    /// Resize the console window (columns x rows)
+    inline void SetSize(SHORT cols, SHORT rows) {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        COORD size = { cols, rows };
+        SetConsoleScreenBufferSize(h, size);
+        SMALL_RECT rect = { 0, 0, static_cast<SHORT>(cols - 1), static_cast<SHORT>(rows - 1) };
+        SetConsoleWindowInfo(h, TRUE, &rect);
+    }
+
+    /// Print colored text then reset
+    inline void PrintColor(const std::string& text, WORD color = FOREGROUND_GREEN | FOREGROUND_INTENSITY) {
+        SetColor(color);
+        std::fputs(text.c_str(), stdout);
+        ResetColor();
+    }
+
+    /// Print a horizontal rule across the console
+    inline void PrintRule(char ch = '-', int width = 80) {
+        std::string line(width, ch);
+        line += '\n';
+        std::fputs(line.c_str(), stdout);
+    }
+
+} // namespace Console
+
+// ============================================================
+//  SECTION 20 — Taskbar Progress (ITaskbarList3)
+// ============================================================
+namespace Progress {
+
+#ifndef __ITaskbarList3_INTERFACE_DEFINED__
+    // Minimal definition if not available in older SDKs
+    typedef enum TBPFLAG {
+        TBPF_NOPROGRESS    = 0,
+        TBPF_INDETERMINATE = 0x1,
+        TBPF_NORMAL        = 0x2,
+        TBPF_ERROR         = 0x4,
+        TBPF_PAUSED        = 0x8
+    } TBPFLAG;
+#endif
+
+    /// RAII wrapper for taskbar progress bar (Windows 7+)
+    struct TaskbarProgress {
+        ITaskbarList3* pTbl = nullptr;
+        HWND hwnd = nullptr;
+
+        explicit TaskbarProgress(HWND targetHwnd = nullptr) {
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_ALL,
+                __uuidof(ITaskbarList3), reinterpret_cast<void**>(&pTbl));
+            hwnd = targetHwnd ? targetHwnd : GetConsoleWindow();
+            if (pTbl) pTbl->HrInit();
+        }
+        ~TaskbarProgress() {
+            if (pTbl) { pTbl->SetProgressState(hwnd, TBPF_NOPROGRESS); pTbl->Release(); }
+        }
+
+        /// Set progress 0-100
+        void Set(ULONGLONG value, ULONGLONG total = 100) {
+            if (pTbl) pTbl->SetProgressValue(hwnd, value, total);
+        }
+
+        void SetState(TBPFLAG state) {
+            if (pTbl) pTbl->SetProgressState(hwnd, state);
+        }
+
+        void SetIndeterminate() { SetState(TBPF_INDETERMINATE); }
+        void SetError()         { SetState(TBPF_ERROR);         }
+        void SetPaused()        { SetState(TBPF_PAUSED);        }
+        void SetNormal()        { SetState(TBPF_NORMAL);        }
+        void Clear()            { SetState(TBPF_NOPROGRESS);    }
+    };
+
+} // namespace Progress
+
+// ============================================================
+//  SECTION 21 — System Extras
+// ============================================================
+namespace System {
+
+    // (extends existing System namespace)
+
+    /// Check if the current process is running as Administrator
+    inline bool IsAdmin() {
+        BOOL isAdmin = FALSE;
+        PSID adminGroup = nullptr;
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        if (AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+            CheckTokenMembership(nullptr, adminGroup, &isAdmin);
+            FreeSid(adminGroup);
+        }
+        return isAdmin != FALSE;
+    }
+
+    /// Get all available drive letters (e.g. {"C:\\", "D:\\"})
+    inline std::vector<std::string> GetDrives() {
+        std::vector<std::string> drives;
+        DWORD mask = GetLogicalDrives();
+        for (int i = 0; i < 26; ++i) {
+            if (mask & (1 << i)) {
+                std::string d = " :\\";
+                d[0] = static_cast<char>('A' + i);
+                drives.push_back(d);
+            }
+        }
+        return drives;
+    }
+
+    /// Get battery status. Returns {percent, isCharging}. {-1, false} if no battery.
+    inline std::pair<int, bool> GetBatteryStatus() {
+        SYSTEM_POWER_STATUS sps{};
+        if (!GetSystemPowerStatus(&sps)) return { -1, false };
+        if (sps.BatteryLifePercent == 255) return { -1, false }; // no battery
+        return { static_cast<int>(sps.BatteryLifePercent), (sps.ACLineStatus == 1) };
+    }
+
+    /// Relaunch the current executable as Administrator
+    inline bool RelaunchAsAdmin() {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize  = sizeof(sei);
+        sei.lpVerb  = L"runas";
+        sei.lpFile  = exe;
+        sei.nShow   = SW_SHOWNORMAL;
+        return ShellExecuteExW(&sei) != FALSE;
+    }
+
+} // namespace System
+
+// ============================================================
+//  SECTION 22 — File Extras
+// ============================================================
+namespace File {
+
+    /// Create multiple files at once from a list of {path, content} pairs
+    inline int CreateMany(const std::vector<std::pair<std::string, std::string>>& files) {
+        int count = 0;
+        for (auto& [path, content] : files)
+            if (Create(path, content)) ++count;
+        return count; // returns number successfully created
+    }
+
+    /// Watch a directory for changes. Calls onChange() when a change is detected.
+    /// Runs in the calling thread — call from a dedicated thread.
+    /// Set *running = false from another thread to stop.
+    inline void Watch(const std::string& dir, std::function<void(const std::string&)> onChange,
+                      bool* running = nullptr) {
+        HANDLE hDir = CreateFileW(Str::ToWide(dir).c_str(), FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+        if (hDir == INVALID_HANDLE_VALUE) return;
+        std::vector<BYTE> buf(65536);
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        static bool _defaultRunning = true;
+        if (!running) running = &_defaultRunning;
+        while (*running) {
+            DWORD bytesReturned = 0;
+            ResetEvent(ov.hEvent);
+            ReadDirectoryChangesW(hDir, buf.data(), static_cast<DWORD>(buf.size()), TRUE,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+                &bytesReturned, &ov, nullptr);
+            if (WaitForSingleObject(ov.hEvent, 500) == WAIT_OBJECT_0) {
+                GetOverlappedResult(hDir, &ov, &bytesReturned, FALSE);
+                auto* info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buf.data());
+                do {
+                    std::wstring wname(info->FileName, info->FileNameLength / sizeof(wchar_t));
+                    onChange(dir + "\\" + Str::ToNarrow(wname));
+                    if (!info->NextEntryOffset) break;
+                    info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
+                        reinterpret_cast<BYTE*>(info) + info->NextEntryOffset);
+                } while (true);
+            }
+        }
+        CloseHandle(ov.hEvent);
+        CloseHandle(hDir);
+    }
+
+} // namespace File
+
+// ============================================================
+//  SECTION 23 — Mouse Record & Replay
+// ============================================================
+namespace Mouse {
+
+    struct MouseEvent {
+        DWORD type;    // MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN, etc.
+        int   x, y;
+        DWORD delayMs; // delay after this event
+    };
+
+    inline std::vector<MouseEvent>& _recording() {
+        static std::vector<MouseEvent> v;
+        return v;
+    }
+    inline bool& _isRecording() { static bool b = false; return b; }
+    inline std::chrono::steady_clock::time_point& _lastTime() {
+        static auto t = std::chrono::steady_clock::now(); return t;
+    }
+
+    /// Start recording mouse events. Call StopRecording() to end.
+    inline void StartRecording() {
+        _recording().clear();
+        _isRecording() = true;
+        _lastTime()    = std::chrono::steady_clock::now();
+    }
+
+    /// Record a single frame (call repeatedly, e.g. in a timer loop at ~60Hz)
+    inline void RecordFrame() {
+        if (!_isRecording()) return;
+        POINT p = GetPos();
+        auto now   = std::chrono::steady_clock::now();
+        DWORD delay = static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastTime()).count());
+        _lastTime() = now;
+        _recording().push_back({ MOUSEEVENTF_MOVE, p.x, p.y, delay });
+    }
+
+    /// Stop recording and return the recorded events
+    inline std::vector<MouseEvent> StopRecording() {
+        _isRecording() = false;
+        return _recording();
+    }
+
+    /// Replay a previously recorded sequence
+    inline void Replay(const std::vector<MouseEvent>& events, float speedMultiplier = 1.0f) {
+        for (auto& e : events) {
+            SetPos(e.x, e.y);
+            if (e.type != MOUSEEVENTF_MOVE)
+                mouse_event(e.type, 0, 0, 0, 0);
+            DWORD delay = static_cast<DWORD>(e.delayMs / speedMultiplier);
+            if (delay > 0) ::Sleep(delay);
+        }
+    }
+
+    /// Save recorded events to a file
+    inline bool SaveRecording(const std::vector<MouseEvent>& events, const std::string& path) {
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return false;
+        size_t count = events.size();
+        f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        f.write(reinterpret_cast<const char*>(events.data()), count * sizeof(MouseEvent));
+        return f.good();
+    }
+
+    /// Load recorded events from a file
+    inline std::vector<MouseEvent> LoadRecording(const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return {};
+        size_t count = 0;
+        f.read(reinterpret_cast<char*>(&count), sizeof(count));
+        std::vector<MouseEvent> events(count);
+        f.read(reinterpret_cast<char*>(events.data()), count * sizeof(MouseEvent));
+        return events;
+    }
+
+} // namespace Mouse
+
+// ============================================================
+//  SECTION 24 — Tray Icon
+// ============================================================
+namespace Tray {
+
+    // Forward declaration of internal window proc
+    inline LRESULT CALLBACK _TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
+    struct TrayIcon {
+        NOTIFYICONDATAW nid{};
+        HWND            hwnd    = nullptr;
+        HMENU           hMenu   = nullptr;
+        std::map<UINT, std::function<void()>> menuCallbacks;
+        std::function<void()> onLeftClick;
+        bool            created = false;
+
+        TrayIcon() = default;
+
+        /// Initialize with a tooltip text and optional icon
+        bool Init(const std::string& tooltip, HICON icon = nullptr) {
+            // Create a hidden message-only window
+            WNDCLASSEXW wc{};
+            wc.cbSize        = sizeof(wc);
+            wc.lpfnWndProc   = _TrayWndProc;
+            wc.hInstance     = GetModuleHandleW(nullptr);
+            wc.lpszClassName = L"WinUtilsTray";
+            RegisterClassExW(&wc);
+            hwnd = CreateWindowExW(0, L"WinUtilsTray", L"", 0, 0, 0, 0, 0,
+                HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+            nid.cbSize           = sizeof(nid);
+            nid.hWnd             = hwnd;
+            nid.uID              = 1;
+            nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+            nid.uCallbackMessage = WM_APP + 1;
+            nid.hIcon            = icon ? icon : LoadIconW(nullptr, IDI_APPLICATION);
+            wcsncpy_s(nid.szTip, Str::ToWide(tooltip).c_str(), 127);
+            created = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+            hMenu   = CreatePopupMenu();
+            return created;
+        }
+
+        /// Add a menu item with a callback
+        void AddMenuItem(const std::string& label, std::function<void()> cb, UINT id = 0) {
+            static UINT nextId = 2000;
+            if (id == 0) id = nextId++;
+            AppendMenuW(hMenu, MF_STRING, id, Str::ToWide(label).c_str());
+            menuCallbacks[id] = std::move(cb);
+        }
+
+        /// Add a separator line
+        void AddSeparator() { AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr); }
+
+        /// Set callback for left click on the tray icon
+        void OnLeftClick(std::function<void()> cb) { onLeftClick = std::move(cb); }
+
+        /// Update the tooltip text
+        void SetTooltip(const std::string& tip) {
+            wcsncpy_s(nid.szTip, Str::ToWide(tip).c_str(), 127);
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+
+        /// Run the tray message loop (blocking)
+        void RunLoop() {
+            MSG msg{};
+            while (GetMessageW(&msg, nullptr, 0, 0)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        /// Remove the tray icon and destroy
+        void Destroy() {
+            if (created) Shell_NotifyIconW(NIM_DELETE, &nid);
+            if (hMenu)   DestroyMenu(hMenu);
+            if (hwnd)    DestroyWindow(hwnd);
+            created = false;
+        }
+
+        ~TrayIcon() { Destroy(); }
+    };
+
+    inline LRESULT CALLBACK _TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        TrayIcon* tray = reinterpret_cast<TrayIcon*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_APP + 1 && tray) {
+            if (lp == WM_LBUTTONUP && tray->onLeftClick)
+                tray->onLeftClick();
+            if (lp == WM_RBUTTONUP) {
+                POINT p{}; GetCursorPos(&p);
+                SetForegroundWindow(hwnd);
+                UINT cmd = TrackPopupMenu(tray->hMenu, TPM_RETURNCMD | TPM_NONOTIFY, p.x, p.y, 0, hwnd, nullptr);
+                if (cmd && tray->menuCallbacks.count(cmd))
+                    tray->menuCallbacks[cmd]();
+            }
+        }
+        if (msg == WM_COMMAND && tray && tray->menuCallbacks.count(static_cast<UINT>(wp)))
+            tray->menuCallbacks[static_cast<UINT>(wp)]();
+        if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+} // namespace Tray
 
 } // namespace WinUtils
 
 #endif // WIN_UTILS_HPP
 
 // ============================================================
-//  QUICK REFERENCE
+//  QUICK REFERENCE — FULL
 // ============================================================
 //
 //  WinUtils::Str::         ToWide, ToNarrow, Format, Split, Trim, ReplaceAll
 //  WinUtils::Dialog::      Message, Error, Warning, YesNo, YesNoCancel,
 //                          OpenFile, SaveFile, BrowseFolder, InputBox
-//  WinUtils::File::        Create, ReadAll, WriteAll, Append, Delete,
-//                          Copy, Move, Exists, Size, CreateDir, DeleteDir,
-//                          ListDir, ExeDir, TempDir, TempFile
+//  WinUtils::File::        Create, CreateMany, ReadAll, WriteAll, Append,
+//                          Delete, Copy, Move, Exists, Size, CreateDir,
+//                          DeleteDir, ListDir, ExeDir, TempDir, TempFile,
+//                          Watch
 //  WinUtils::Mouse::       GetPos, SetPos, MoveBy, Hide, Show,
 //                          LeftClick, RightClick, DoubleClick, Scroll,
-//                          ClickAt, SetCursorIcon, Confine, SmoothMove
+//                          ClickAt, SetCursorIcon, Confine, SmoothMove,
+//                          StartRecording, RecordFrame, StopRecording,
+//                          Replay, SaveRecording, LoadRecording
 //  WinUtils::Keyboard::    Press, KeyDown, KeyUp, TypeText, IsDown,
 //                          Copy, Paste, Undo
 //  WinUtils::Clipboard::   GetText, SetText, Clear
@@ -1115,13 +1811,28 @@ namespace Screen {
 //  WinUtils::System::      GetUsername, GetComputerName, GetWindowsVersion,
 //                          GetMemoryMB, GetCPUCount, GetSpecialFolder,
 //                          Desktop, AppData, Documents, Downloads, System32,
-//                          Sleep, Now, SetEnv, GetEnv, LockScreen, Power
+//                          Sleep, Now, SetEnv, GetEnv, LockScreen, Power,
+//                          IsAdmin, GetDrives, GetBatteryStatus, RelaunchAsAdmin
 //  WinUtils::Registry::    ReadString, WriteString, DeleteValue,
 //                          AddToStartup, RemoveFromStartup
 //  WinUtils::Notify::      Balloon
 //  WinUtils::Audio::       Beep, SystemSound, Tone, PlayWAV, StopSound
 //  WinUtils::Log::         Logger, Default() .debug/.info/.warn/.error
 //  WinUtils::Hotkey::      Register, UnregisterAll, Process, RunLoop
-//  WinUtils::Screen::      Capture, GetPixelColor, GetPixelRGB
+//  WinUtils::Screen::      Capture, SaveBMP, GetPixelColor, GetPixelRGB,
+//                          FindColor
+//  WinUtils::Net::         HttpGet, HttpPost, DownloadFile, GetLocalIP,
+//                          IsConnected
+//  WinUtils::Crypto::      XorObfuscate, SHA256, MD5, Base64Encode,
+//                          Base64Decode
+//  WinUtils::Ini::         Read, ReadInt, Write, WriteInt, DeleteKey,
+//                          DeleteSection
+//  WinUtils::Console::     SetColor, ResetColor, Clear, SetTitle,
+//                          SetCursorPos, ShowCursor, SetSize,
+//                          PrintColor, PrintRule
+//  WinUtils::Progress::    TaskbarProgress  .Set, .SetIndeterminate,
+//                          .SetError, .SetPaused, .SetNormal, .Clear
+//  WinUtils::Tray::        TrayIcon  .Init, .AddMenuItem, .AddSeparator,
+//                          .OnLeftClick, .SetTooltip, .RunLoop, .Destroy
 //
 // ============================================================
