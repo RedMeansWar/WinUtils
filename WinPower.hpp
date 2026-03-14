@@ -25,6 +25,31 @@
  * IN THE SOFTWARE.
  *
  * ============================================================================
+ * LEGAL NOTICE & ETHICAL USE POLICY
+ * ============================================================================
+ *
+ * This file contains low-level Windows system utilities that overlap with
+ * techniques used in both legitimate security tools and malicious software.
+ *
+ * AUTHORIZED USE ONLY. You may use this software on systems you own or have
+ * explicit written authorization to access and modify. Penetration testers
+ * must have a signed scope-of-work agreement before using these functions
+ * against any target system.
+ *
+ * PROHIBITED: Use against systems you do not own or are not authorized to
+ * test. Creating malware, spyware, ransomware, or any software designed to
+ * harm, surveil, or extort. Violation of the CFAA, UK Computer Misuse Act,
+ * EU Directive on Attacks Against Information Systems, or equivalent law.
+ *
+ * Several functions in this file WILL be flagged by antivirus and EDR
+ * products. This is expected and intentional — detections are technique-based.
+ *
+ * THE AUTHOR ACCEPTS ZERO RESPONSIBILITY FOR MISUSE, DATA LOSS, SYSTEM
+ * DAMAGE, LEGAL CONSEQUENCES, OR ANY OTHER OUTCOME FROM USE OF THIS SOFTWARE.
+ *
+ * If you are unsure whether your intended use is authorized — stop.
+ *
+ * ============================================================================
  *
  * WARNING — ELEVATED PRIVILEGES AND SYSTEM-LEVEL ACCESS.
  * USE AT YOUR OWN RISK.

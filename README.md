@@ -31,6 +31,107 @@ WinUtils is a header-only Windows utility library for C++17. No external depende
 #include "WinKernel.hpp"      // kernel + anti-cheat (requires WinUtils + WinPower)
 ```
 
+## ⚠️ Legal Disclaimer & Ethical Use Policy
+
+**READ THIS BEFORE USING THIS LIBRARY.**
+
+Copyright (c) 2026 RedMeansWar. This software is provided under the MIT License.
+By using, copying, modifying, or distributing this software you agree to the following:
+
+---
+
+### This Library is a Tool. Tools Are Neutral. Intent Is Not.
+
+WinUtils contains functionality that overlaps with techniques used in:
+- Windows optimization and system administration software
+- Security research and penetration testing tools
+- Anti-cheat and anti-tamper systems
+- Malware, rootkits, and offensive security exploits
+
+**The same code that lets an anti-cheat detect injected DLLs is the same code that injects them.**
+**The same code that protects game assets with encryption is the same code used in ransomware.**
+
+This is not a warning that the library is dangerous. It is a statement of fact about how this
+class of software works. You are responsible for what you do with it.
+
+---
+
+### Authorized Use
+
+You **MAY** use this library for:
+- Software running on systems you personally own
+- Security research on systems you have **written, explicit authorization** to test
+- Penetration testing engagements with a signed scope-of-work agreement
+- Anti-cheat systems for games or software you develop
+- Windows optimization, system administration, or utility tools
+- Educational purposes in isolated/lab environments
+- Any lawful purpose on systems you are authorized to operate on
+
+---
+
+### Prohibited Use
+
+You **MAY NOT** use this library for:
+- Accessing, modifying, or monitoring systems you do not own and have not been authorized to test
+- Creating malware, ransomware, spyware, or any software designed to harm, surveil, or extort
+- Bypassing security controls on systems without explicit written authorization
+- Any activity that violates the Computer Fraud and Abuse Act (CFAA), the UK Computer Misuse Act,
+  the EU Directive on Attacks Against Information Systems, or equivalent laws in your jurisdiction
+- Targeting individuals, organizations, or infrastructure without authorization
+
+---
+
+### Penetration Testers & Security Researchers
+
+If you are a penetration tester or security researcher using this library:
+
+- You are responsible for ensuring you have a valid, written scope-of-work or authorization document
+  before using any `WinPower.hpp` or `WinKernel.hpp` functionality against a target system
+- Functions like `Inject::InjectDLL`, `Token::StealFromProcess`, `Admin::BypassUACComHijack`,
+  and `Memory::Write` are **inherently destructive** — use them only within your authorized scope
+- Several functions in this library **will be flagged by antivirus and EDR products by design**.
+  This is expected behavior. Do not attempt to use this library to evade detection on systems
+  you are not authorized to test
+- The author is not responsible for engagements that go out of scope, cause unintended damage,
+  or result in legal action due to unauthorized use
+
+---
+
+### Malware Researchers & AV/EDR Developers
+
+If you are developing defensive security tools, analyzing malware behavior, or building detection
+signatures using this library as a reference:
+
+- This library is intentionally documented so that the techniques are understood clearly
+- Understanding offensive techniques is essential to building effective defenses
+- Use of this library in a sandboxed or isolated analysis environment is encouraged
+- The author supports the security research community and the responsible disclosure process
+
+---
+
+### No Warranty. No Liability.
+
+This software is provided **"AS IS"** without warranty of any kind. The author:
+
+- Makes no guarantees about fitness for any particular purpose
+- Accepts **zero responsibility** for data loss, system damage, instability, BSODs,
+  or any other outcome arising from use or misuse of this software
+- Accepts **zero responsibility** for legal consequences resulting from misuse
+- Accepts **zero responsibility** for antivirus detections, game bans, account suspensions,
+  or any other consequence of using flagged techniques
+
+**If you are unsure whether your intended use is legal or authorized — it probably isn't. Don't do it.**
+
+---
+
+### Reporting Misuse
+
+If you discover this library being used maliciously or distributed as part of malware,
+please report it. The goal of this project is to empower legitimate developers, researchers,
+and system administrators — not to enable harm.
+
+---
+
 ---
 
 ## Requirements

@@ -25,6 +25,26 @@
  * IN THE SOFTWARE.
  *
  * ============================================================================
+ * LEGAL NOTICE & ETHICAL USE POLICY
+ * ============================================================================
+ *
+ * This file interfaces with the Windows kernel and contains anti-cheat
+ * detection techniques used by professional game security systems.
+ *
+ * AUTHORIZED USE ONLY. Kernel drivers must be loaded only on systems you own
+ * or have explicit written authorization to modify. Loading unsigned drivers
+ * requires test signing mode which weakens system security — use in
+ * controlled environments only.
+ *
+ * The anti-cheat techniques in this file are provided for legitimate game
+ * developers and security researchers. Using them to BYPASS anti-cheat
+ * systems rather than implement them is a violation of most game ToS agreements
+ * and potentially applicable computer misuse law.
+ *
+ * THE AUTHOR ACCEPTS ZERO RESPONSIBILITY FOR MISUSE, BSOD, DATA LOSS, GAME
+ * BANS, LEGAL CONSEQUENCES, OR ANY OTHER OUTCOME FROM USE OF THIS SOFTWARE.
+ *
+ * ============================================================================
  *
  * WARNING — KERNEL-LEVEL AND SECURITY-SENSITIVE FUNCTIONALITY.
  * USE AT YOUR OWN RISK.
@@ -53,7 +73,7 @@
  * Reference: See README.md for full documentation
  *
  * ============================================================================
- */
+*/
 
 #pragma once
 #ifndef WIN_KERNEL_HPP
