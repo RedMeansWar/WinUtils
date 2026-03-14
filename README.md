@@ -1,8 +1,6 @@
 # WinUtils
 ### A Comprehensive Windows Utility Header Library
 
-> *"Just Monika."* — DDLC
-
 **Copyright (c) 2026 RedMeansWar** — MIT License
 
 > **USE AT YOUR OWN RISK.**
