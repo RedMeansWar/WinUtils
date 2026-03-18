@@ -46,12 +46,7 @@
 #ifndef WIN_HARDWARE_HPP
 #define WIN_HARDWARE_HPP
 
-#ifndef WIN_UTILS_HPP
-// ! WinHardware.hpp requires WinUtils.hpp — #include "WinUtils.hpp" first.
-// ! This is to avoid circular dependencies, as WinUtils.hpp contains some basic utilities
-// ! that WinHardware.hpp relies on. Please include WinUtils.hpp before including this file.
 #include "WinUtils.hpp"
-#endif
 
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -872,13 +867,13 @@ namespace Software {
     inline std::vector<InstalledApp> GetInstalled() {
         std::vector<InstalledApp> result;
         auto readFrom = [&](HKEY root, const std::string& subkey) {
-            HKEY hk;
+            HKEY hk = nullptr;
             if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
                 return;
             wchar_t name[256]; DWORD nameSz = 256; DWORD idx = 0;
             while (RegEnumKeyExW(hk, idx++, name, &nameSz, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
                 nameSz = 256;
-                HKEY appKey;
+                HKEY appKey = nullptr;
                 std::wstring appPath = Str::ToWide(subkey) + L"\\" + name;
                 if (RegOpenKeyExW(root, appPath.c_str(), 0, KEY_READ, &appKey) != ERROR_SUCCESS) continue;
                 auto readVal = [&](const std::string& val) -> std::string {

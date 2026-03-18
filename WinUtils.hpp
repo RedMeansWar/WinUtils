@@ -46,7 +46,6 @@
  * ============================================================================
 */
 
-
 #pragma once
 #ifndef WIN_UTILS_HPP
 #define WIN_UTILS_HPP
@@ -55,11 +54,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -78,7 +75,6 @@
 #include <comdef.h>
 #include <wbemidl.h>
 #include <winioctl.h>
-#include <winsock.h>
 
 // ---- Standard headers ----
 #include <string>
@@ -94,6 +90,8 @@
 #include <algorithm>
 #include <map>
 #include <cmath>
+#include <intrin.h>
+#include <winsock2.h>
 
 // ---- Pragma comments (auto-link) ----
 #pragma comment(lib, "user32.lib")
@@ -401,6 +399,54 @@ namespace File {
         return Str::ToNarrow(tmpFile);
     }
 
+
+    // (merged from extension block)
+
+    /// Create multiple files at once from a list of {path, content} pairs
+    inline int CreateMany(const std::vector<std::pair<std::string, std::string>>& files) {
+        int count = 0;
+        for (auto& [path, content] : files)
+            if (Create(path, content)) ++count;
+        return count; // returns number successfully created
+    }
+
+    /// Watch a directory for changes. Calls onChange() when a change is detected.
+    /// Runs in the calling thread — call from a dedicated thread.
+    /// Set *running = false from another thread to stop.
+    inline void Watch(const std::string& dir, std::function<void(const std::string&)> onChange,
+                      bool* running = nullptr) {
+        HANDLE hDir = CreateFileW(Str::ToWide(dir).c_str(), FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+        if (hDir == INVALID_HANDLE_VALUE) return;
+        std::vector<BYTE> buf(65536);
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        static bool _defaultRunning = true;
+        if (!running) running = &_defaultRunning;
+        while (*running) {
+            DWORD bytesReturned = 0;
+            ResetEvent(ov.hEvent);
+            ReadDirectoryChangesW(hDir, buf.data(), static_cast<DWORD>(buf.size()), TRUE,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+                &bytesReturned, &ov, nullptr);
+            if (WaitForSingleObject(ov.hEvent, 500) == WAIT_OBJECT_0) {
+                GetOverlappedResult(hDir, &ov, &bytesReturned, FALSE);
+                auto* info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buf.data());
+                do {
+                    std::wstring wname(info->FileName, info->FileNameLength / sizeof(wchar_t));
+                    onChange(dir + "\\" + Str::ToNarrow(wname));
+                    if (!info->NextEntryOffset) break;
+                    info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
+                        reinterpret_cast<BYTE*>(info) + info->NextEntryOffset);
+                } while (true);
+            }
+        }
+        CloseHandle(ov.hEvent);
+        CloseHandle(hDir);
+    }
+
 } // namespace File
 
 // ============================================================
@@ -493,6 +539,79 @@ namespace Mouse {
             SetCursorPos(nx, ny);
             std::this_thread::sleep_for(std::chrono::milliseconds(ms / steps));
         }
+    }
+
+
+    // (merged from extension block)
+
+    struct MouseEvent {
+        DWORD type;    // MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN, etc.
+        int   x, y;
+        DWORD delayMs; // delay after this event
+    };
+
+    inline std::vector<MouseEvent>& _recording() {
+        static std::vector<MouseEvent> v;
+        return v;
+    }
+    inline bool& _isRecording() { static bool b = false; return b; }
+    inline std::chrono::steady_clock::time_point& _lastTime() {
+        static auto t = std::chrono::steady_clock::now(); return t;
+    }
+
+    /// Start recording mouse events. Call StopRecording() to end.
+    inline void StartRecording() {
+        _recording().clear();
+        _isRecording() = true;
+        _lastTime()    = std::chrono::steady_clock::now();
+    }
+
+    /// Record a single frame (call repeatedly, e.g. in a timer loop at ~60Hz)
+    inline void RecordFrame() {
+        if (!_isRecording()) return;
+        POINT p = GetPos();
+        auto now   = std::chrono::steady_clock::now();
+        DWORD delay = static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastTime()).count());
+        _lastTime() = now;
+        _recording().push_back({ MOUSEEVENTF_MOVE, p.x, p.y, delay });
+    }
+
+    /// Stop recording and return the recorded events
+    inline std::vector<MouseEvent> StopRecording() {
+        _isRecording() = false;
+        return _recording();
+    }
+
+    /// Replay a previously recorded sequence
+    inline void Replay(const std::vector<MouseEvent>& events, float speedMultiplier = 1.0f) {
+        for (auto& e : events) {
+            SetPos(e.x, e.y);
+            if (e.type != MOUSEEVENTF_MOVE)
+                mouse_event(e.type, 0, 0, 0, 0);
+            DWORD delay = static_cast<DWORD>(e.delayMs / speedMultiplier);
+            if (delay > 0) ::Sleep(delay);
+        }
+    }
+
+    /// Save recorded events to a file
+    inline bool SaveRecording(const std::vector<MouseEvent>& events, const std::string& path) {
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return false;
+        size_t count = events.size();
+        f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        f.write(reinterpret_cast<const char*>(events.data()), count * sizeof(MouseEvent));
+        return f.good();
+    }
+
+    /// Load recorded events from a file
+    inline std::vector<MouseEvent> LoadRecording(const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return {};
+        size_t count = 0;
+        f.read(reinterpret_cast<char*>(&count), sizeof(count));
+        std::vector<MouseEvent> events(count);
+        f.read(reinterpret_cast<char*>(events.data()), count * sizeof(MouseEvent));
+        return events;
     }
 
 } // namespace Mouse
@@ -1212,7 +1331,7 @@ namespace System {
     /// Shutdown / Restart / Logoff
     enum class PowerAction { Shutdown, Restart, Logoff };
     inline bool Power(PowerAction action, bool force = false) {
-        HANDLE hToken;
+        HANDLE hToken = nullptr;
         TOKEN_PRIVILEGES tp{};
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
             LookupPrivilegeValueW(nullptr, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid);
@@ -1230,6 +1349,58 @@ namespace System {
         return ExitWindowsEx(flags, SHTDN_REASON_MINOR_OTHER) != 0;
     }
 
+
+    // (merged from extension block)
+
+    // (extends existing System namespace)
+
+    /// Check if the current process is running as Administrator
+    inline bool IsAdmin() {
+        BOOL isAdmin = FALSE;
+        PSID adminGroup = nullptr;
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        if (AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+            CheckTokenMembership(nullptr, adminGroup, &isAdmin);
+            FreeSid(adminGroup);
+        }
+        return isAdmin != FALSE;
+    }
+
+    /// Get all available drive letters (e.g. {"C:\\", "D:\\"})
+    inline std::vector<std::string> GetDrives() {
+        std::vector<std::string> drives;
+        DWORD mask = GetLogicalDrives();
+        for (int i = 0; i < 26; ++i) {
+            if (mask & (1 << i)) {
+                std::string d = " :\\";
+                d[0] = static_cast<char>('A' + i);
+                drives.push_back(d);
+            }
+        }
+        return drives;
+    }
+
+    /// Get battery status. Returns {percent, isCharging}. {-1, false} if no battery.
+    inline std::pair<int, bool> GetBatteryStatus() {
+        SYSTEM_POWER_STATUS sps{};
+        if (!GetSystemPowerStatus(&sps)) return { -1, false };
+        if (sps.BatteryLifePercent == 255) return { -1, false }; // no battery
+        return { static_cast<int>(sps.BatteryLifePercent), (sps.ACLineStatus == 1) };
+    }
+
+    /// Relaunch the current executable as Administrator
+    inline bool RelaunchAsAdmin() {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize  = sizeof(sei);
+        sei.lpVerb  = L"runas";
+        sei.lpFile  = exe;
+        sei.nShow   = SW_SHOWNORMAL;
+        return ShellExecuteExW(&sei) != FALSE;
+    }
+
 } // namespace System
 
 // ============================================================
@@ -1239,7 +1410,7 @@ namespace Registry {
 
     /// Read a string value from the registry
     inline std::optional<std::string> ReadString(HKEY root, const std::string& subkey, const std::string& name) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return std::nullopt;
         wchar_t buf[4096] = {};
@@ -1253,7 +1424,7 @@ namespace Registry {
 
     /// Write a string value to the registry
     inline bool WriteString(HKEY root, const std::string& subkey, const std::string& name, const std::string& value) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegCreateKeyExW(root, Str::ToWide(subkey).c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
             return false;
         std::wstring wval = Str::ToWide(value);
@@ -1264,7 +1435,7 @@ namespace Registry {
 
     /// Delete a registry value
     inline bool DeleteValue(HKEY root, const std::string& subkey, const std::string& name) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_WRITE, &hk) != ERROR_SUCCESS)
             return false;
         LSTATUS r = RegDeleteValueW(hk, Str::ToWide(name).c_str());
@@ -1288,7 +1459,7 @@ namespace Registry {
 
     /// Read a DWORD value
     inline std::optional<DWORD> ReadDWORD(HKEY root, const std::string& subkey, const std::string& name) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return std::nullopt;
         DWORD val = 0, sz = sizeof(DWORD), type = REG_DWORD;
@@ -1301,7 +1472,7 @@ namespace Registry {
 
     /// Write a DWORD value
     inline bool WriteDWORD(HKEY root, const std::string& subkey, const std::string& name, DWORD value) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegCreateKeyExW(root, Str::ToWide(subkey).c_str(), 0, nullptr,
             REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
             return false;
@@ -1313,7 +1484,7 @@ namespace Registry {
 
     /// Read a QWORD (64-bit) value
     inline std::optional<uint64_t> ReadQWORD(HKEY root, const std::string& subkey, const std::string& name) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return std::nullopt;
         uint64_t val = 0; DWORD sz = sizeof(val), type = REG_QWORD;
@@ -1326,7 +1497,7 @@ namespace Registry {
 
     /// Write a QWORD (64-bit) value
     inline bool WriteQWORD(HKEY root, const std::string& subkey, const std::string& name, uint64_t value) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegCreateKeyExW(root, Str::ToWide(subkey).c_str(), 0, nullptr,
             REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
             return false;
@@ -1338,7 +1509,7 @@ namespace Registry {
 
     /// Read raw binary data
     inline std::optional<std::vector<BYTE>> ReadBinary(HKEY root, const std::string& subkey, const std::string& name) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return std::nullopt;
         DWORD sz = 0;
@@ -1353,7 +1524,7 @@ namespace Registry {
     /// Write raw binary data
     inline bool WriteBinary(HKEY root, const std::string& subkey, const std::string& name,
                             const std::vector<BYTE>& data) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegCreateKeyExW(root, Str::ToWide(subkey).c_str(), 0, nullptr,
             REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
             return false;
@@ -1365,7 +1536,7 @@ namespace Registry {
 
     /// Read a MULTI_SZ (list of strings) value
     inline std::vector<std::string> ReadMultiString(HKEY root, const std::string& subkey, const std::string& name) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return {};
         DWORD sz = 0;
@@ -1386,7 +1557,7 @@ namespace Registry {
 
     /// Check if a registry key exists
     inline bool KeyExists(HKEY root, const std::string& subkey) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return false;
         RegCloseKey(hk);
@@ -1395,7 +1566,7 @@ namespace Registry {
 
     /// Check if a registry value exists
     inline bool ValueExists(HKEY root, const std::string& subkey, const std::string& name) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return false;
         LSTATUS r = RegQueryValueExW(hk, Str::ToWide(name).c_str(), nullptr, nullptr, nullptr, nullptr);
@@ -1405,7 +1576,7 @@ namespace Registry {
 
     /// Create a registry key (does nothing if it already exists)
     inline bool CreateKey(HKEY root, const std::string& subkey) {
-        HKEY hk;
+        HKEY hk = nullptr;
         LSTATUS r = RegCreateKeyExW(root, Str::ToWide(subkey).c_str(), 0, nullptr,
             REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hk, nullptr);
         if (r == ERROR_SUCCESS) RegCloseKey(hk);
@@ -1420,7 +1591,7 @@ namespace Registry {
 
     /// List all value names under a key
     inline std::vector<std::string> ListValues(HKEY root, const std::string& subkey) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return {};
         std::vector<std::string> result;
@@ -1435,7 +1606,7 @@ namespace Registry {
 
     /// List all subkey names under a key
     inline std::vector<std::string> ListSubkeys(HKEY root, const std::string& subkey) {
-        HKEY hk;
+        HKEY hk = nullptr;
         if (RegOpenKeyExW(root, Str::ToWide(subkey).c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
             return {};
         std::vector<std::string> result;
@@ -1951,6 +2122,31 @@ namespace Crypto {
         return out;
     }
 
+
+    /// Check if the CPU supports AES-NI hardware acceleration
+    /// AES-NI makes AES operations 3-10x faster on supported hardware
+    inline bool HasAESNI() {
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 1);
+        // AES-NI is bit 25 of ECX in CPUID leaf 1
+        return (cpuInfo[2] & (1 << 25)) != 0;
+    }
+
+    /// Check if the CPU supports CLMUL (carry-less multiplication)
+    /// Required for hardware-accelerated GCM mode
+    inline bool HasCLMUL() {
+        int cpuInfo[4] = {};
+        __cpuid(cpuInfo, 1);
+        // PCLMULQDQ is bit 1 of ECX in CPUID leaf 1
+        return (cpuInfo[2] & (1 << 1)) != 0;
+    }
+
+    /// Returns true if both AES-NI and CLMUL are available
+    /// This means AES-GCM will run fully in hardware on this CPU
+    inline bool HasFullHardwareAES() {
+        return HasAESNI() && HasCLMUL();
+    }
+
     /// Base64 decode a string
     inline std::string Base64Decode(const std::string& input) {
         static const int T[256] = {
@@ -2143,187 +2339,14 @@ namespace Progress {
 // ============================================================
 //  SECTION 21 — System Extras
 // ============================================================
-namespace System {
-
-    // (extends existing System namespace)
-
-    /// Check if the current process is running as Administrator
-    inline bool IsAdmin() {
-        BOOL isAdmin = FALSE;
-        PSID adminGroup = nullptr;
-        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
-        if (AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
-            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
-            CheckTokenMembership(nullptr, adminGroup, &isAdmin);
-            FreeSid(adminGroup);
-        }
-        return isAdmin != FALSE;
-    }
-
-    /// Get all available drive letters (e.g. {"C:\\", "D:\\"})
-    inline std::vector<std::string> GetDrives() {
-        std::vector<std::string> drives;
-        DWORD mask = GetLogicalDrives();
-        for (int i = 0; i < 26; ++i) {
-            if (mask & (1 << i)) {
-                std::string d = " :\\";
-                d[0] = static_cast<char>('A' + i);
-                drives.push_back(d);
-            }
-        }
-        return drives;
-    }
-
-    /// Get battery status. Returns {percent, isCharging}. {-1, false} if no battery.
-    inline std::pair<int, bool> GetBatteryStatus() {
-        SYSTEM_POWER_STATUS sps{};
-        if (!GetSystemPowerStatus(&sps)) return { -1, false };
-        if (sps.BatteryLifePercent == 255) return { -1, false }; // no battery
-        return { static_cast<int>(sps.BatteryLifePercent), (sps.ACLineStatus == 1) };
-    }
-
-    /// Relaunch the current executable as Administrator
-    inline bool RelaunchAsAdmin() {
-        wchar_t exe[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        SHELLEXECUTEINFOW sei{};
-        sei.cbSize  = sizeof(sei);
-        sei.lpVerb  = L"runas";
-        sei.lpFile  = exe;
-        sei.nShow   = SW_SHOWNORMAL;
-        return ShellExecuteExW(&sei) != FALSE;
-    }
-
-} // namespace System
 
 // ============================================================
 //  SECTION 22 — File Extras
 // ============================================================
-namespace File {
-
-    /// Create multiple files at once from a list of {path, content} pairs
-    inline int CreateMany(const std::vector<std::pair<std::string, std::string>>& files) {
-        int count = 0;
-        for (auto& [path, content] : files)
-            if (Create(path, content)) ++count;
-        return count; // returns number successfully created
-    }
-
-    /// Watch a directory for changes. Calls onChange() when a change is detected.
-    /// Runs in the calling thread — call from a dedicated thread.
-    /// Set *running = false from another thread to stop.
-    inline void Watch(const std::string& dir, std::function<void(const std::string&)> onChange,
-                      bool* running = nullptr) {
-        HANDLE hDir = CreateFileW(Str::ToWide(dir).c_str(), FILE_LIST_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
-        if (hDir == INVALID_HANDLE_VALUE) return;
-        std::vector<BYTE> buf(65536);
-        OVERLAPPED ov{};
-        ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-        static bool _defaultRunning = true;
-        if (!running) running = &_defaultRunning;
-        while (*running) {
-            DWORD bytesReturned = 0;
-            ResetEvent(ov.hEvent);
-            ReadDirectoryChangesW(hDir, buf.data(), static_cast<DWORD>(buf.size()), TRUE,
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
-                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
-                &bytesReturned, &ov, nullptr);
-            if (WaitForSingleObject(ov.hEvent, 500) == WAIT_OBJECT_0) {
-                GetOverlappedResult(hDir, &ov, &bytesReturned, FALSE);
-                auto* info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buf.data());
-                do {
-                    std::wstring wname(info->FileName, info->FileNameLength / sizeof(wchar_t));
-                    onChange(dir + "\\" + Str::ToNarrow(wname));
-                    if (!info->NextEntryOffset) break;
-                    info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
-                        reinterpret_cast<BYTE*>(info) + info->NextEntryOffset);
-                } while (true);
-            }
-        }
-        CloseHandle(ov.hEvent);
-        CloseHandle(hDir);
-    }
-
-} // namespace File
 
 // ============================================================
 //  SECTION 23 — Mouse Record & Replay
 // ============================================================
-namespace Mouse {
-
-    struct MouseEvent {
-        DWORD type;    // MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN, etc.
-        int   x, y;
-        DWORD delayMs; // delay after this event
-    };
-
-    inline std::vector<MouseEvent>& _recording() {
-        static std::vector<MouseEvent> v;
-        return v;
-    }
-    inline bool& _isRecording() { static bool b = false; return b; }
-    inline std::chrono::steady_clock::time_point& _lastTime() {
-        static auto t = std::chrono::steady_clock::now(); return t;
-    }
-
-    /// Start recording mouse events. Call StopRecording() to end.
-    inline void StartRecording() {
-        _recording().clear();
-        _isRecording() = true;
-        _lastTime()    = std::chrono::steady_clock::now();
-    }
-
-    /// Record a single frame (call repeatedly, e.g. in a timer loop at ~60Hz)
-    inline void RecordFrame() {
-        if (!_isRecording()) return;
-        POINT p = GetPos();
-        auto now   = std::chrono::steady_clock::now();
-        DWORD delay = static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastTime()).count());
-        _lastTime() = now;
-        _recording().push_back({ MOUSEEVENTF_MOVE, p.x, p.y, delay });
-    }
-
-    /// Stop recording and return the recorded events
-    inline std::vector<MouseEvent> StopRecording() {
-        _isRecording() = false;
-        return _recording();
-    }
-
-    /// Replay a previously recorded sequence
-    inline void Replay(const std::vector<MouseEvent>& events, float speedMultiplier = 1.0f) {
-        for (auto& e : events) {
-            SetPos(e.x, e.y);
-            if (e.type != MOUSEEVENTF_MOVE)
-                mouse_event(e.type, 0, 0, 0, 0);
-            DWORD delay = static_cast<DWORD>(e.delayMs / speedMultiplier);
-            if (delay > 0) ::Sleep(delay);
-        }
-    }
-
-    /// Save recorded events to a file
-    inline bool SaveRecording(const std::vector<MouseEvent>& events, const std::string& path) {
-        std::ofstream f(path, std::ios::binary);
-        if (!f) return false;
-        size_t count = events.size();
-        f.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        f.write(reinterpret_cast<const char*>(events.data()), count * sizeof(MouseEvent));
-        return f.good();
-    }
-
-    /// Load recorded events from a file
-    inline std::vector<MouseEvent> LoadRecording(const std::string& path) {
-        std::ifstream f(path, std::ios::binary);
-        if (!f) return {};
-        size_t count = 0;
-        f.read(reinterpret_cast<char*>(&count), sizeof(count));
-        std::vector<MouseEvent> events(count);
-        f.read(reinterpret_cast<char*>(events.data()), count * sizeof(MouseEvent));
-        return events;
-    }
-
-} // namespace Mouse
 
 // ============================================================
 //  SECTION 24 — Tray Icon
@@ -2666,6 +2689,261 @@ namespace FileAttr {
 } // namespace FileAttr
 
 // ============================================================
+//  SECTION 33 — File Encryption (AES-256-CBC via Windows CNG)
+// ============================================================
+//  Encrypt and decrypt files using AES-256-CBC via the Windows
+//  Cryptography Next Generation (CNG) API. No external libs.
+//  Keys are derived from a password using SHA-256.
+//  Perfect for protecting game assets, configs, or anti-cheat
+//  files so they can't be read or tampered with at rest.
+// ============================================================
+namespace Encrypt {
+
+    // Internal helpers
+    namespace _enc {
+        inline std::vector<BYTE> DeriveKey(const std::string& password) {
+            // SHA-256 of the password = 32 byte AES-256 key
+            BCRYPT_ALG_HANDLE hAlg = nullptr;
+            BCRYPT_HASH_HANDLE hHash = nullptr;
+            BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+            DWORD hashLen = 32, cbData = 0;
+            BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH,
+                reinterpret_cast<PUCHAR>(&hashLen), sizeof(DWORD), &cbData, 0);
+            std::vector<BYTE> key(hashLen);
+            BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+            BCryptHashData(hHash,
+                reinterpret_cast<PUCHAR>(const_cast<char*>(password.c_str())),
+                static_cast<ULONG>(password.size()), 0);
+            BCryptFinishHash(hHash, key.data(), hashLen, 0);
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return key;
+        }
+
+        // Generate cryptographically random bytes
+        inline std::vector<BYTE> RandomBytes(DWORD count) {
+            std::vector<BYTE> buf(count);
+            BCRYPT_ALG_HANDLE hRng = nullptr;
+            BCryptOpenAlgorithmProvider(&hRng, BCRYPT_RNG_ALGORITHM, nullptr, 0);
+            BCryptGenRandom(hRng, buf.data(), count, 0);
+            BCryptCloseAlgorithmProvider(hRng, 0);
+            return buf;
+        }
+
+        inline BCRYPT_KEY_HANDLE ImportAESKey(BCRYPT_ALG_HANDLE hAlg,
+                                               const std::vector<BYTE>& key) {
+            // Build BCRYPT_KEY_DATA_BLOB
+            DWORD blobSz = sizeof(BCRYPT_KEY_DATA_BLOB_HEADER) +
+                           static_cast<DWORD>(key.size());
+            std::vector<BYTE> blob(blobSz);
+            auto* hdr = reinterpret_cast<BCRYPT_KEY_DATA_BLOB_HEADER*>(blob.data());
+            hdr->dwMagic   = BCRYPT_KEY_DATA_BLOB_MAGIC;
+            hdr->dwVersion = BCRYPT_KEY_DATA_BLOB_VERSION1;
+            hdr->cbKeyData = static_cast<DWORD>(key.size());
+            memcpy(blob.data() + sizeof(BCRYPT_KEY_DATA_BLOB_HEADER),
+                key.data(), key.size());
+            BCRYPT_KEY_HANDLE hKey = nullptr;
+            BCryptImportKey(hAlg, nullptr, BCRYPT_KEY_DATA_BLOB,
+                &hKey, nullptr, 0, blob.data(), blobSz, 0);
+            return hKey;
+        }
+    }
+
+    /// Encrypt a block of data with AES-256-CBC using a password.
+    /// Output format: [16 byte IV][encrypted data (padded to 16 byte blocks)]
+    inline std::vector<BYTE> EncryptData(const std::vector<BYTE>& data,
+                                          const std::string& password) {
+        auto key = _enc::DeriveKey(password);
+        auto iv  = _enc::RandomBytes(16);
+
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, MS_PRIMITIVE_PROVIDER, BCRYPT_PROV_DISPATCH);
+        BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
+            sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+
+        BCRYPT_KEY_HANDLE hKey = _enc::ImportAESKey(hAlg, key);
+
+        // Calculate output size with PKCS7 padding
+        DWORD encSz = 0;
+        std::vector<BYTE> ivCopy = iv; // BCryptEncrypt modifies IV in-place
+        BCryptEncrypt(hKey,
+            const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()),
+            nullptr, ivCopy.data(), 16, nullptr, 0, &encSz, BCRYPT_BLOCK_PADDING);
+
+        std::vector<BYTE> encData(encSz);
+        ivCopy = iv;
+        BCryptEncrypt(hKey,
+            const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()),
+            nullptr, ivCopy.data(), 16,
+            encData.data(), encSz, &encSz, BCRYPT_BLOCK_PADDING);
+
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        // Prepend IV to output
+        std::vector<BYTE> result;
+        result.reserve(16 + encSz);
+        result.insert(result.end(), iv.begin(), iv.end());
+        result.insert(result.end(), encData.begin(), encData.begin() + encSz);
+        return result;
+    }
+
+    /// Decrypt data previously encrypted with EncryptData.
+    /// Returns empty vector on failure (wrong password or corrupted data).
+    inline std::vector<BYTE> DecryptData(const std::vector<BYTE>& data,
+                                          const std::string& password) {
+        if (data.size() < 17) return {}; // need at least IV + 1 block
+        auto key = _enc::DeriveKey(password);
+
+        // Extract IV (first 16 bytes)
+        std::vector<BYTE> iv(data.begin(), data.begin() + 16);
+        std::vector<BYTE> enc(data.begin() + 16, data.end());
+
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, MS_PRIMITIVE_PROVIDER, BCRYPT_PROV_DISPATCH);
+        BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
+            sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+
+        BCRYPT_KEY_HANDLE hKey = _enc::ImportAESKey(hAlg, key);
+
+        DWORD decSz = 0;
+        BCryptDecrypt(hKey, enc.data(), static_cast<ULONG>(enc.size()),
+            nullptr, iv.data(), 16, nullptr, 0, &decSz, BCRYPT_BLOCK_PADDING);
+
+        std::vector<BYTE> decData(decSz);
+        NTSTATUS status = BCryptDecrypt(hKey, enc.data(),
+            static_cast<ULONG>(enc.size()),
+            nullptr, iv.data(), 16,
+            decData.data(), decSz, &decSz, BCRYPT_BLOCK_PADDING);
+
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        if (!BCRYPT_SUCCESS(status)) return {};
+        decData.resize(decSz);
+        return decData;
+    }
+
+    /// Encrypt a string and return the result as a Base64-encoded string
+    inline std::string EncryptString(const std::string& text,
+                                      const std::string& password) {
+        std::vector<BYTE> data(text.begin(), text.end());
+        auto enc = EncryptData(data, password);
+        return Crypto::Base64Encode(std::string(enc.begin(), enc.end()));
+    }
+
+    /// Decrypt a Base64-encoded string previously encrypted with EncryptString
+    inline std::string DecryptString(const std::string& b64cipher,
+                                      const std::string& password) {
+        auto raw = Crypto::Base64Decode(b64cipher);
+        std::vector<BYTE> enc(raw.begin(), raw.end());
+        auto dec = DecryptData(enc, password);
+        return std::string(dec.begin(), dec.end());
+    }
+
+    /// Encrypt a file in-place. Original file is overwritten with encrypted data.
+    /// A ".enc" extension is appended unless you specify a destination path.
+    inline bool EncryptFile(const std::string& filePath,
+                             const std::string& password,
+                             const std::string& outputPath = "") {
+        auto content = File::ReadAll(filePath);
+        if (!content) return false;
+        std::vector<BYTE> data(content->begin(), content->end());
+        auto enc = EncryptData(data, password);
+        std::string dest = outputPath.empty() ? filePath + ".enc" : outputPath;
+        std::ofstream f(dest, std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<const char*>(enc.data()), enc.size());
+        return f.good();
+    }
+
+    /// Decrypt a file previously encrypted with EncryptFile.
+    inline bool DecryptFile(const std::string& encFilePath,
+                             const std::string& password,
+                             const std::string& outputPath = "") {
+        std::ifstream f(encFilePath, std::ios::binary);
+        if (!f) return false;
+        std::vector<BYTE> enc(
+            (std::istreambuf_iterator<char>(f)),
+            (std::istreambuf_iterator<char>()));
+        auto dec = DecryptData(enc, password);
+        if (dec.empty()) return false;
+        // Strip .enc extension for default output path
+        std::string dest = outputPath;
+        if (dest.empty()) {
+            dest = encFilePath;
+            if (dest.size() > 4 && dest.substr(dest.size() - 4) == ".enc")
+                dest = dest.substr(0, dest.size() - 4);
+            else
+                dest += ".dec";
+        }
+        std::ofstream out(dest, std::ios::binary);
+        if (!out) return false;
+        out.write(reinterpret_cast<const char*>(dec.data()), dec.size());
+        return out.good();
+    }
+
+    /// Encrypt all files in a directory with a given extension
+    /// Returns count of successfully encrypted files
+    inline int EncryptDirectory(const std::string& dir,
+                                  const std::string& password,
+                                  const std::string& ext = "") {
+        int count = 0;
+        std::error_code ec;
+        for (auto& entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
+            if (!entry.is_regular_file()) continue;
+            if (!ext.empty() && entry.path().extension() != ext) continue;
+            if (EncryptFile(entry.path().string(), password)) ++count;
+        }
+        return count;
+    }
+
+    /// Decrypt all .enc files in a directory
+    inline int DecryptDirectory(const std::string& dir, const std::string& password) {
+        int count = 0;
+        std::error_code ec;
+        for (auto& entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() != ".enc") continue;
+            if (DecryptFile(entry.path().string(), password)) ++count;
+        }
+        return count;
+    }
+
+    /// Generate a strong random password of given length
+    inline std::string GeneratePassword(int length = 32) {
+        static const char chars[] =
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789!@#$%^&*()_+-=[]{}";
+        auto rnd = _enc::RandomBytes(length);
+        std::string result(length, ' ');
+        for (int i = 0; i < length; ++i)
+            result[i] = chars[rnd[i] % (sizeof(chars) - 1)];
+        return result;
+    }
+
+    /// Securely wipe a file before deleting (overwrite with random data 3 passes)
+    inline bool SecureDelete(const std::string& path) {
+        auto size = File::Size(path);
+        if (!size) return false;
+        std::ofstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        if (!f) return false;
+        for (int pass = 0; pass < 3; ++pass) {
+            f.seekp(0);
+            auto rnd = _enc::RandomBytes(static_cast<DWORD>(*size));
+            f.write(reinterpret_cast<const char*>(rnd.data()), rnd.size());
+            f.flush();
+        }
+        f.close();
+        return File::Delete(path);
+    }
+
+} // namespace Encrypt
+
+// ============================================================
 //  SECTION 34 — AES-256-GCM Authenticated Encryption
 // ============================================================
 //  AES-GCM combines encryption AND authentication in one pass.
@@ -2680,10 +2958,10 @@ namespace FileAttr {
 //  Wrong password or tampered file = decryption returns empty.
 // ============================================================
 namespace EncryptGCM {
- 
+
     // Internal helpers shared with Encrypt namespace
     namespace _gcm {
- 
+
         /// Derive a 32-byte AES-256 key from a password using SHA-256
         inline std::vector<BYTE> DeriveKey(const std::string& password) {
             BCRYPT_ALG_HANDLE hAlg = nullptr;
@@ -2702,7 +2980,7 @@ namespace EncryptGCM {
             BCryptCloseAlgorithmProvider(hAlg, 0);
             return key;
         }
- 
+
         /// Generate cryptographically secure random bytes
         inline std::vector<BYTE> RandomBytes(DWORD count) {
             std::vector<BYTE> buf(count);
@@ -2712,7 +2990,7 @@ namespace EncryptGCM {
             BCryptCloseAlgorithmProvider(hRng, 0);
             return buf;
         }
- 
+
         /// Import a raw AES key into a CNG key handle
         inline BCRYPT_KEY_HANDLE ImportAESKey(BCRYPT_ALG_HANDLE hAlg,
                                                const std::vector<BYTE>& key) {
@@ -2731,7 +3009,7 @@ namespace EncryptGCM {
             return hKey;
         }
     }
- 
+
     /// Encrypt data using AES-256-GCM.
     /// Output format: [12 byte nonce][16 byte auth tag][ciphertext]
     /// The auth tag ensures integrity — any tampering causes decryption to fail.
@@ -2739,15 +3017,15 @@ namespace EncryptGCM {
                                           const std::string& password) {
         auto key   = _gcm::DeriveKey(password);
         auto nonce = _gcm::RandomBytes(12); // 96-bit nonce for GCM
- 
+
         BCRYPT_ALG_HANDLE hAlg = nullptr;
-        BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+        BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, MS_PRIMITIVE_PROVIDER, BCRYPT_PROV_DISPATCH);
         BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
             reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
             sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
- 
+
         BCRYPT_KEY_HANDLE hKey = _gcm::ImportAESKey(hAlg, key);
- 
+
         // Set up authenticated encryption info
         BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
         BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
@@ -2758,7 +3036,7 @@ namespace EncryptGCM {
         authInfo.cbTag       = 16;
         authInfo.pbAuthData  = nullptr;  // no additional authenticated data
         authInfo.cbAuthData  = 0;
- 
+
         // Encrypt
         std::vector<BYTE> ciphertext(plaintext.size());
         DWORD cipherLen = 0;
@@ -2770,12 +3048,12 @@ namespace EncryptGCM {
             ciphertext.data(),
             static_cast<ULONG>(ciphertext.size()),
             &cipherLen, 0);
- 
+
         BCryptDestroyKey(hKey);
         BCryptCloseAlgorithmProvider(hAlg, 0);
- 
+
         if (!BCRYPT_SUCCESS(status)) return {};
- 
+
         // Pack: nonce (12) + tag (16) + ciphertext
         std::vector<BYTE> result;
         result.reserve(12 + 16 + cipherLen);
@@ -2784,7 +3062,7 @@ namespace EncryptGCM {
         result.insert(result.end(), ciphertext.begin(), ciphertext.begin() + cipherLen);
         return result;
     }
- 
+
     /// Decrypt data encrypted with EncryptData (AES-256-GCM).
     /// Returns empty vector if password is wrong OR if the data was tampered with.
     /// You cannot tell the difference — both look the same from outside. That's by design.
@@ -2792,22 +3070,22 @@ namespace EncryptGCM {
                                           const std::string& password) {
         // Minimum: 12 (nonce) + 16 (tag) + 1 (at least 1 byte ciphertext)
         if (data.size() < 29) return {};
- 
+
         auto key = _gcm::DeriveKey(password);
- 
+
         // Unpack header
         std::vector<BYTE> nonce(data.begin(), data.begin() + 12);
         std::vector<BYTE> tag(data.begin() + 12, data.begin() + 28);
         std::vector<BYTE> ciphertext(data.begin() + 28, data.end());
- 
+
         BCRYPT_ALG_HANDLE hAlg = nullptr;
-        BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+        BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, MS_PRIMITIVE_PROVIDER, BCRYPT_PROV_DISPATCH);
         BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
             reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
             sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
- 
+
         BCRYPT_KEY_HANDLE hKey = _gcm::ImportAESKey(hAlg, key);
- 
+
         BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
         BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
         authInfo.pbNonce    = nonce.data();
@@ -2816,7 +3094,7 @@ namespace EncryptGCM {
         authInfo.cbTag      = 16;
         authInfo.pbAuthData = nullptr;
         authInfo.cbAuthData = 0;
- 
+
         std::vector<BYTE> plaintext(ciphertext.size());
         DWORD plainLen = 0;
         NTSTATUS status = BCryptDecrypt(hKey,
@@ -2827,17 +3105,17 @@ namespace EncryptGCM {
             plaintext.data(),
             static_cast<ULONG>(plaintext.size()),
             &plainLen, 0);
- 
+
         BCryptDestroyKey(hKey);
         BCryptCloseAlgorithmProvider(hAlg, 0);
- 
+
         // STATUS_AUTH_TAG_MISMATCH (0xC000A002) = wrong password or tampered data
         if (!BCRYPT_SUCCESS(status)) return {};
- 
+
         plaintext.resize(plainLen);
         return plaintext;
     }
- 
+
     /// Encrypt a string, returns Base64-encoded ciphertext
     inline std::string EncryptString(const std::string& plaintext,
                                       const std::string& password) {
@@ -2846,7 +3124,7 @@ namespace EncryptGCM {
         if (enc.empty()) return {};
         return Crypto::Base64Encode(std::string(enc.begin(), enc.end()));
     }
- 
+
     /// Decrypt a Base64-encoded string. Returns empty on wrong password or tampered data.
     inline std::string DecryptString(const std::string& b64cipher,
                                       const std::string& password) {
@@ -2856,7 +3134,7 @@ namespace EncryptGCM {
         if (dec.empty()) return {};
         return std::string(dec.begin(), dec.end());
     }
- 
+
     /// Encrypt a file with AES-256-GCM. Output: path + ".gcm" unless specified.
     /// Any tampering with the output file will cause decryption to fail.
     inline bool EncryptFile(const std::string& path,
@@ -2864,7 +3142,9 @@ namespace EncryptGCM {
                              const std::string& outputPath = "") {
         std::ifstream f(path, std::ios::binary);
         if (!f) return false;
-        std::vector<BYTE> data(std::istreambuf_iterator<char>(f), {});
+        std::vector<BYTE> data(
+            (std::istreambuf_iterator<char>(f)),
+            std::istreambuf_iterator<char>());
         auto enc = EncryptData(data, password);
         if (enc.empty()) return false;
         std::string dest = outputPath.empty() ? path + ".gcm" : outputPath;
@@ -2873,14 +3153,16 @@ namespace EncryptGCM {
         out.write(reinterpret_cast<const char*>(enc.data()), enc.size());
         return out.good();
     }
- 
+
     /// Decrypt a .gcm file. Returns false if password is wrong or file was tampered with.
     inline bool DecryptFile(const std::string& encPath,
                              const std::string& password,
                              const std::string& outputPath = "") {
         std::ifstream f(encPath, std::ios::binary);
         if (!f) return false;
-        std::vector<BYTE> enc(std::istreambuf_iterator<char>(f), {});
+        std::vector<BYTE> enc(
+            (std::istreambuf_iterator<char>(f)),
+            std::istreambuf_iterator<char>());
         auto dec = DecryptData(enc, password);
         if (dec.empty()) return false; // wrong password OR tampered
         std::string dest = outputPath;
@@ -2896,7 +3178,7 @@ namespace EncryptGCM {
         out.write(reinterpret_cast<const char*>(dec.data()), dec.size());
         return out.good();
     }
- 
+
     /// Encrypt all files in a directory with AES-256-GCM
     inline int EncryptDirectory(const std::string& dir,
                                   const std::string& password,
@@ -2910,7 +3192,7 @@ namespace EncryptGCM {
         }
         return count;
     }
- 
+
     /// Decrypt all .gcm files in a directory
     inline int DecryptDirectory(const std::string& dir, const std::string& password) {
         int count = 0;
@@ -2922,24 +3204,26 @@ namespace EncryptGCM {
         }
         return count;
     }
- 
+
     /// Verify a file's integrity without fully decrypting it.
     /// Returns true if the password is correct and the file is unmodified.
     /// Returns false if the password is wrong OR the file was tampered with.
     inline bool VerifyFile(const std::string& encPath, const std::string& password) {
         std::ifstream f(encPath, std::ios::binary);
         if (!f) return false;
-        std::vector<BYTE> enc(std::istreambuf_iterator<char>(f), {});
+        std::vector<BYTE> enc(
+            (std::istreambuf_iterator<char>(f)),
+            std::istreambuf_iterator<char>());
         // DecryptData returns empty on any auth failure
         return !DecryptData(enc, password).empty();
     }
- 
+
 } // namespace EncryptGCM
- 
+
 } // namespace WinUtils
- 
+
 #endif // WIN_UTILS_HPP
- 
+
 // ============================================================
 //  QUICK REFERENCE — WinUtils.hpp
 // ============================================================
@@ -2949,7 +3233,7 @@ namespace EncryptGCM {
 //  Net        Crypto        Ini           Console       Progress
 //  Tray       Drive         FileAttr      Encrypt       EncryptGCM
 // ============================================================
- 
+
 // ============================================================
 //  QUICK REFERENCE — WinUtils.hpp
 // ============================================================

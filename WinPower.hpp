@@ -78,26 +78,20 @@
  * Requires : Windows (Win32 API), C++17 or later, WinUtils.hpp
  * Reference: See README.md for full namespace and function documentation
  *
- * "Just Monika." — DDLC
- *
  * ============================================================================
- */
-
+*/
 
 #pragma once
 #ifndef WIN_POWER_HPP
 #define WIN_POWER_HPP
 
-#ifndef WIN_UTILS_HPP
-// ! WinPower.hpp requires WinUtils.hpp — #include "WinUtils.hpp" first.
-// ! This is to avoid circular dependencies, as WinUtils.hpp contains some basic utilities
-// ! that WinPower.hpp relies on. Please include WinUtils.hpp before including this file.
+// WinUtils.hpp is required — include it automatically if not already included
 #include "WinUtils.hpp"
-#endif
 
 #include <winternl.h>
 #include <processthreadsapi.h>
 #include <synchapi.h>
+#include <algorithm>
 
 // Define missing process access constants if not already defined
 #ifndef PROCESS_SYNCHRONIZE
@@ -773,6 +767,121 @@ namespace Memory {
         CloseHandle(snap); return r;
     }
 
+    // (unique functions from duplicate block)
+    inline std::string ReadString(DWORD pid, uintptr_t addr, size_t maxLen = 256) {
+        std::vector<char> buf(maxLen, 0);
+        Read(pid, addr, buf.data(), maxLen);
+        return std::string(buf.data());
+    }
+
+    inline std::wstring ReadWString(DWORD pid, uintptr_t addr, size_t maxChars = 256) {
+        std::vector<wchar_t> buf(maxChars, 0);
+        Read(pid, addr, buf.data(), maxChars * sizeof(wchar_t));
+        return std::wstring(buf.data());
+    }
+
+    inline bool WriteString(DWORD pid, uintptr_t addr, const std::string& str) {
+        return Write(pid, addr, str.c_str(), str.size() + 1);
+    }
+
+    /// Memory region descriptor returned by EnumerateRegions
+    struct MemoryRegion {
+        uintptr_t base;
+        size_t    size;
+        DWORD     protect;   // PAGE_* constants
+        DWORD     state;     // MEM_COMMIT, MEM_RESERVE, MEM_FREE
+        DWORD     type;      // MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE
+    };
+
+    inline std::vector<MemoryRegion> EnumerateRegions(DWORD pid) {
+        std::vector<MemoryRegion> result;
+        HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            FALSE, pid);
+        if (!hp) return result;
+        MEMORY_BASIC_INFORMATION mbi{};
+        uintptr_t addr = 0;
+        while (VirtualQueryEx(hp, reinterpret_cast<LPCVOID>(addr),
+            &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            if (mbi.State == MEM_COMMIT) {
+                MemoryRegion r;
+                r.base    = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                r.size    = mbi.RegionSize;
+                r.protect = mbi.Protect;
+                r.state   = mbi.State;
+                r.type    = mbi.Type;
+                result.push_back(r);
+            }
+            addr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (addr == 0) break; // wrapped around
+        }
+        CloseHandle(hp);
+        return result;
+    }
+
+    /// Scan ALL committed memory regions of a process for a byte pattern.
+    /// Returns first match address, or 0 if not found.
+    /// pat:  vector of bytes to match e.g. {0xDE,0xAD,0xBE,0xEF}
+    /// mask: byte vector where non-zero = must match, 0 = wildcard
+    inline uintptr_t FindPatternAll(DWORD pid,
+        const std::vector<BYTE>& pat, const std::vector<BYTE>& mask) {
+        HANDLE hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+            FALSE, pid);
+        if (!hp) return 0;
+
+        uintptr_t addr = 0;
+        MEMORY_BASIC_INFORMATION mbi{};
+        while (VirtualQueryEx(hp, reinterpret_cast<LPCVOID>(addr),
+            &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            if (mbi.State == MEM_COMMIT &&
+                (mbi.Protect & PAGE_NOACCESS) == 0 &&
+                (mbi.Protect & PAGE_GUARD) == 0) {
+                // Cap region size — mbi.RegionSize can be several GB for
+                // large memory-mapped regions. Reading more than 64MB at
+                // once is unreasonable for a pattern scan.
+                static constexpr SIZE_T MAX_SCAN_CHUNK = 64 * 1024 * 1024; // 64MB
+                SIZE_T scanSize = std::min(mbi.RegionSize, MAX_SCAN_CHUNK);
+                SIZE_T bytesRead = 0;
+                std::vector<BYTE> buf;
+                try { buf.resize(scanSize); }
+                catch (const std::bad_alloc&) { 
+                    // Region too large even after cap — skip it
+                    uintptr_t next2 = reinterpret_cast<uintptr_t>(mbi.BaseAddress)
+                                     + mbi.RegionSize;
+                    if (next2 <= addr) break;
+                    addr = next2;
+                    continue;
+                }
+                if (ReadProcessMemory(hp,
+                    mbi.BaseAddress, buf.data(),
+                    scanSize, &bytesRead) && bytesRead > 0) {
+                    uintptr_t hit = FindPattern(pid,
+                        reinterpret_cast<uintptr_t>(mbi.BaseAddress),
+                        bytesRead, pat, mask);
+                    if (hit) { CloseHandle(hp); return hit; }
+                }
+            }
+            uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress)
+                             + mbi.RegionSize;
+            if (next <= addr) break;
+            addr = next;
+        }
+        CloseHandle(hp);
+        return 0;
+    }
+
+    /// String convenience overload — pattern as "\xDE\xAD" style string,
+    /// mask as "xx" where x=match, ?=wildcard
+    inline uintptr_t FindPatternAll(DWORD pid,
+        const std::string& pattern, const std::string& mask) {
+        std::vector<BYTE> pat(pattern.begin(), pattern.end());
+        // Convert mask: 'x' -> 1 (must match), '?' -> 0 (wildcard)
+        std::vector<BYTE> msk;
+        msk.reserve(mask.size());
+        for (char c : mask)
+            msk.push_back(c == 'x' ? 1 : 0);
+        return FindPatternAll(pid, pat, msk);
+    }
+
 } // namespace Memory
 
 // ============================================================
@@ -805,6 +914,68 @@ namespace AntiDebug {
     inline void TriggerIfDebugged(std::function<void()> onDbg, std::function<void()> otherwise=nullptr) {
         if(AnyDebuggerDetected()){if(onDbg)onDbg();}
         else{if(otherwise)otherwise();}
+    }
+
+    // (unique functions from duplicate block)
+    inline bool CheckHardwareBreakpoints() {
+        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(GetCurrentThread(), &ctx)) return false;
+        return ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3;
+    }
+
+    inline bool CheckNtGlobalFlag() {
+#ifdef _WIN64
+        auto* peb = reinterpret_cast<BYTE*>(__readgsqword(0x60));
+        DWORD flags = *reinterpret_cast<DWORD*>(peb + 0xBC);
+#else
+        auto* peb = reinterpret_cast<BYTE*>(__readfsdword(0x30));
+        DWORD flags = *reinterpret_cast<DWORD*>(peb + 0x68);
+#endif
+        // FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS
+        return (flags & 0x70) != 0;
+    }
+
+    inline bool CheckParentProcess(const std::string& expectedParent = "explorer.exe") {
+        using NtQIP_t = NTSTATUS(NTAPI*)(HANDLE, UINT, PVOID, ULONG, PULONG);
+        auto NtQIP = reinterpret_cast<NtQIP_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+        if (!NtQIP) return false;
+        PROCESS_BASIC_INFORMATION pbi{};
+        NtQIP(GetCurrentProcess(), 0, &pbi, sizeof(pbi), nullptr);
+        // InheritedFromUniqueProcessId is the 6th ULONG_PTR field in PBI
+        // Read it by casting to raw pointer at the correct offset
+        DWORD parentPid = static_cast<DWORD>(
+            *reinterpret_cast<ULONG_PTR*>(
+                reinterpret_cast<BYTE*>(&pbi) + 5 * sizeof(ULONG_PTR)));
+        // Get parent process name
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return false;
+        PROCESSENTRY32W pe{ sizeof(PROCESSENTRY32W) };
+        std::string parentName;
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ProcessID == parentPid) {
+                    parentName = Str::ToNarrow(pe.szExeFile);
+                    std::transform(parentName.begin(), parentName.end(),
+                        parentName.begin(), ::tolower);
+                    break;
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+        std::string exp = expectedParent;
+        std::transform(exp.begin(), exp.end(), exp.begin(), ::tolower);
+        return !parentName.empty() && parentName != exp;
+    }
+
+    inline bool CheckExceptionHandler() {
+        // If a debugger is attached, OutputDebugStringW triggers a handled exception
+        // that causes a measurable timing difference
+        DWORD start = GetTickCount();
+        OutputDebugStringW(L"WinUtils::AntiDebug::CheckExceptionHandler");
+        DWORD elapsed = GetTickCount() - start;
+        // Under a debugger this takes noticeably longer (>1ms vs ~0ms)
+        return elapsed > 2;
     }
 
 } // namespace AntiDebug
@@ -856,6 +1027,88 @@ namespace Inject {
         bool ok=ht!=nullptr;
         if(ht){WaitForSingleObject(ht,10000);CloseHandle(ht);}
         VirtualFreeEx(hp,mem,0,MEM_RELEASE); CloseHandle(hp); return ok;
+    }
+
+    // (unique functions from duplicate block)
+    inline bool HijackThread(DWORD pid, const std::string& dllPath) {
+        Ownership::_EnablePrivilege(SE_DEBUG_NAME);
+        // Find the first thread of the target process
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return false;
+        THREADENTRY32 te{ sizeof(THREADENTRY32) };
+        DWORD targetTid = 0;
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID == pid) { targetTid = te.th32ThreadID; break; }
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+        if (!targetTid) return false;
+
+        HANDLE hp = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
+        HANDLE ht = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+            THREAD_SUSPEND_RESUME, FALSE, targetTid);
+        if (!hp || !ht) {
+            if (hp) CloseHandle(hp);
+            if (ht) CloseHandle(ht);
+            return false;
+        }
+
+        SuspendThread(ht);
+
+        // Get thread context
+        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_FULL;
+        GetThreadContext(ht, &ctx);
+
+        // Allocate memory in target process for the DLL path
+        size_t pathLen = dllPath.size() + 1;
+        LPVOID pathMem = VirtualAllocEx(hp, nullptr, pathLen,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!pathMem) {
+            // Allocation failed — resume thread and clean up
+            ResumeThread(ht);
+            CloseHandle(ht);
+            CloseHandle(hp);
+            return false;
+        }
+        if (!WriteProcessMemory(hp, pathMem, dllPath.c_str(), pathLen, nullptr)) {
+            VirtualFreeEx(hp, pathMem, 0, MEM_RELEASE);
+            ResumeThread(ht);
+            CloseHandle(ht);
+            CloseHandle(hp);
+            return false;
+        }
+
+        LPTHREAD_START_ROUTINE ll = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryA"));
+        if (!ll) {
+            VirtualFreeEx(hp, pathMem, 0, MEM_RELEASE);
+            ResumeThread(ht);
+            CloseHandle(ht);
+            CloseHandle(hp);
+            return false;
+        }
+
+#ifdef _WIN64
+        uintptr_t origRip = ctx.Rip;
+        ctx.Rcx = reinterpret_cast<uintptr_t>(pathMem); // arg1
+        ctx.Rip = reinterpret_cast<DWORD64>(ll);
+#else
+        ctx.Eip = reinterpret_cast<DWORD>(ll);
+        // Push path address onto stack
+        ctx.Esp -= sizeof(DWORD);
+        DWORD pathAddr = reinterpret_cast<DWORD>(pathMem);
+        WriteProcessMemory(hp, reinterpret_cast<LPVOID>(ctx.Esp), &pathAddr, sizeof(DWORD), nullptr);
+#endif
+        SetThreadContext(ht, &ctx);
+        ResumeThread(ht);
+        ::Sleep(200); // give it time to load
+
+        // Free the path memory after the thread has had time to use it
+        VirtualFreeEx(hp, pathMem, 0, MEM_RELEASE);
+        CloseHandle(ht);
+        CloseHandle(hp);
+        return true;
     }
 
 } // namespace Inject
@@ -940,6 +1193,15 @@ namespace ProcessCtrl {
         ReadProcessMemory(hp, reinterpret_cast<LPCVOID>(imageBase),
             dosHeader, sizeof(dosHeader), nullptr);
         DWORD peOffset = *reinterpret_cast<DWORD*>(dosHeader + 0x3C);
+
+        // Sanity check peOffset — must be within reasonable PE bounds
+        // A valid PE offset is typically between 0x40 and 0x400
+        // Anything outside that range indicates a corrupt or non-PE target
+        if (peOffset < 0x40 || peOffset > 0x1000) {
+            CloseHandle(hp);
+            return 0;
+        }
+
         DWORD entryRva = 0;
         // Optional header starts at peOffset + 0x18
         // AddressOfEntryPoint is at offset 0x10 within the optional header
@@ -1233,389 +1495,16 @@ namespace Token {
 // ============================================================
 //  Additional detection techniques beyond the basics.
 // ============================================================
-namespace AntiDebug {
-
-    inline bool IsDebuggerPresent()  { return ::IsDebuggerPresent() != FALSE; }
-    inline bool IsRemoteDebugger()   { BOOL p=FALSE; CheckRemoteDebuggerPresent(GetCurrentProcess(),&p); return p!=FALSE; }
-
-    inline bool CheckHeapFlags() {
-#ifdef _WIN64
-        auto* peb=reinterpret_cast<BYTE*>(__readgsqword(0x60));
-        return (*reinterpret_cast<DWORD*>(peb+0x70)&0x70)!=0||*reinterpret_cast<DWORD*>(peb+0x74)!=0;
-#else
-        auto* peb=reinterpret_cast<BYTE*>(__readfsdword(0x30));
-        return (*reinterpret_cast<DWORD*>(peb+0x40)&0x70)!=0||*reinterpret_cast<DWORD*>(peb+0x44)!=0;
-#endif
-    }
-
-    /// Check for hardware breakpoints in the current thread's debug registers
-    inline bool CheckHardwareBreakpoints() {
-        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (!GetThreadContext(GetCurrentThread(), &ctx)) return false;
-        return ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3;
-    }
-
-    /// Check NtGlobalFlag in PEB — set by debuggers
-    inline bool CheckNtGlobalFlag() {
-#ifdef _WIN64
-        auto* peb = reinterpret_cast<BYTE*>(__readgsqword(0x60));
-        DWORD flags = *reinterpret_cast<DWORD*>(peb + 0xBC);
-#else
-        auto* peb = reinterpret_cast<BYTE*>(__readfsdword(0x30));
-        DWORD flags = *reinterpret_cast<DWORD*>(peb + 0x68);
-#endif
-        // FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS
-        return (flags & 0x70) != 0;
-    }
-
-    /// Check if a parent process is an unexpected debugger
-    /// (e.g. parent should be explorer.exe, not x64dbg.exe)
-    inline bool CheckParentProcess(const std::string& expectedParent = "explorer.exe") {
-        using NtQIP_t = NTSTATUS(NTAPI*)(HANDLE, UINT, PVOID, ULONG, PULONG);
-        auto NtQIP = reinterpret_cast<NtQIP_t>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
-        if (!NtQIP) return false;
-        PROCESS_BASIC_INFORMATION pbi{};
-        NtQIP(GetCurrentProcess(), 0, &pbi, sizeof(pbi), nullptr);
-        // InheritedFromUniqueProcessId is the 6th ULONG_PTR field in PBI
-        // Read it by casting to raw pointer at the correct offset
-        DWORD parentPid = static_cast<DWORD>(
-            *reinterpret_cast<ULONG_PTR*>(
-                reinterpret_cast<BYTE*>(&pbi) + 5 * sizeof(ULONG_PTR)));
-        // Get parent process name
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE) return false;
-        PROCESSENTRY32W pe{ sizeof(PROCESSENTRY32W) };
-        std::string parentName;
-        if (Process32FirstW(snap, &pe)) {
-            do {
-                if (pe.th32ProcessID == parentPid) {
-                    parentName = Str::ToNarrow(pe.szExeFile);
-                    std::transform(parentName.begin(), parentName.end(),
-                        parentName.begin(), ::tolower);
-                    break;
-                }
-            } while (Process32NextW(snap, &pe));
-        }
-        CloseHandle(snap);
-        std::string exp = expectedParent;
-        std::transform(exp.begin(), exp.end(), exp.begin(), ::tolower);
-        return !parentName.empty() && parentName != exp;
-    }
-
-    /// Exception-based debugger detection using OutputDebugString timing trick
-    /// (avoids __try/__except which requires /EHa compiler flag)
-    inline bool CheckExceptionHandler() {
-        // If a debugger is attached, OutputDebugStringW triggers a handled exception
-        // that causes a measurable timing difference
-        DWORD start = GetTickCount();
-        OutputDebugStringW(L"WinUtils::AntiDebug::CheckExceptionHandler");
-        DWORD elapsed = GetTickCount() - start;
-        // Under a debugger this takes noticeably longer (>1ms vs ~0ms)
-        return elapsed > 2;
-    }
-
-    inline void HideFromDebugger() {
-        typedef NTSTATUS(NTAPI* _PFN_NSIT1)(HANDLE,UINT,PVOID,ULONG);
-        _PFN_NSIT1 f = reinterpret_cast<_PFN_NSIT1>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtSetInformationThread"));
-        if(f) f(GetCurrentThread(),17,nullptr,0);
-    }
-
-    inline void BlockDebuggerAttach() {
-        typedef NTSTATUS(NTAPI* _PFN_NSIP1)(HANDLE,UINT,PVOID,ULONG);
-        _PFN_NSIP1 f = reinterpret_cast<_PFN_NSIP1>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtSetInformationProcess"));
-        DWORD v=1; if(f) f(GetCurrentProcess(),31,&v,sizeof(v));
-    }
-
-    /// Run all detection checks
-    inline bool AnyDebuggerDetected() {
-        return IsDebuggerPresent()    ||
-               IsRemoteDebugger()     ||
-               CheckHeapFlags()       ||
-               CheckNtGlobalFlag()    ||
-               CheckHardwareBreakpoints();
-    }
-
-    inline void TriggerIfDebugged(std::function<void()> onDbg,
-                                   std::function<void()> otherwise = nullptr) {
-        if (AnyDebuggerDetected()) { if (onDbg) onDbg(); }
-        else                       { if (otherwise) otherwise(); }
-    }
-
-} // namespace AntiDebug
 
 // ============================================================
 //  SECTION P10 — Extended Memory Utilities
 // ============================================================
-namespace Memory {
-
-    inline bool Read(DWORD pid, uintptr_t addr, void* buf, size_t sz) {
-        HANDLE h=OpenProcess(PROCESS_VM_READ,FALSE,pid); if(!h) return false;
-        SIZE_T n=0; bool ok=ReadProcessMemory(h,reinterpret_cast<LPCVOID>(addr),buf,sz,&n)&&n==sz;
-        CloseHandle(h); return ok;
-    }
-    inline bool Write(DWORD pid, uintptr_t addr, const void* buf, size_t sz) {
-        HANDLE h=OpenProcess(PROCESS_VM_WRITE|PROCESS_VM_OPERATION,FALSE,pid); if(!h) return false;
-        SIZE_T n=0; bool ok=WriteProcessMemory(h,reinterpret_cast<LPVOID>(addr),buf,sz,&n)&&n==sz;
-        CloseHandle(h); return ok;
-    }
-    template<typename T> inline std::optional<T> ReadT(DWORD pid, uintptr_t addr) {
-        T v{}; if(!Read(pid,addr,&v,sizeof(T))) return std::nullopt; return v;
-    }
-    template<typename T> inline bool WriteT(DWORD pid, uintptr_t addr, const T& val) {
-        return Write(pid,addr,&val,sizeof(T));
-    }
-
-    /// Read a null-terminated ASCII string from a remote process
-    inline std::string ReadString(DWORD pid, uintptr_t addr, size_t maxLen = 256) {
-        std::vector<char> buf(maxLen, 0);
-        Read(pid, addr, buf.data(), maxLen);
-        return std::string(buf.data());
-    }
-
-    /// Read a null-terminated wide string from a remote process
-    inline std::wstring ReadWString(DWORD pid, uintptr_t addr, size_t maxChars = 256) {
-        std::vector<wchar_t> buf(maxChars, 0);
-        Read(pid, addr, buf.data(), maxChars * sizeof(wchar_t));
-        return std::wstring(buf.data());
-    }
-
-    /// Write a string to a remote process (including null terminator)
-    inline bool WriteString(DWORD pid, uintptr_t addr, const std::string& str) {
-        return Write(pid, addr, str.c_str(), str.size() + 1);
-    }
-
-    inline uintptr_t Alloc(DWORD pid, size_t sz, DWORD protect=PAGE_EXECUTE_READWRITE) {
-        HANDLE h=OpenProcess(PROCESS_VM_OPERATION,FALSE,pid); if(!h) return 0;
-        auto* p=VirtualAllocEx(h,nullptr,sz,MEM_COMMIT|MEM_RESERVE,protect);
-        CloseHandle(h); return reinterpret_cast<uintptr_t>(p);
-    }
-    inline bool Free(DWORD pid, uintptr_t addr) {
-        HANDLE h=OpenProcess(PROCESS_VM_OPERATION,FALSE,pid); if(!h) return false;
-        bool ok=VirtualFreeEx(h,reinterpret_cast<LPVOID>(addr),0,MEM_RELEASE)!=FALSE;
-        CloseHandle(h); return ok;
-    }
-    inline bool Protect(DWORD pid, uintptr_t addr, size_t sz, DWORD prot, DWORD* old=nullptr) {
-        HANDLE h=OpenProcess(PROCESS_VM_OPERATION,FALSE,pid); if(!h) return false;
-        DWORD o=0; bool ok=VirtualProtectEx(h,reinterpret_cast<LPVOID>(addr),sz,prot,&o)!=FALSE;
-        if(old)*old=o; CloseHandle(h); return ok;
-    }
-
-    /// Enumerate all committed memory regions in a remote process
-    struct MemoryRegion {
-        uintptr_t base     = 0;
-        size_t    size     = 0;
-        DWORD     protect  = 0;
-        DWORD     state    = 0;
-        DWORD     type     = 0;
-    };
-
-    inline std::vector<MemoryRegion> EnumerateRegions(DWORD pid) {
-        std::vector<MemoryRegion> result;
-        HANDLE hp = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-            FALSE, pid);
-        if (!hp) return result;
-        MEMORY_BASIC_INFORMATION mbi{};
-        uintptr_t addr = 0;
-        while (VirtualQueryEx(hp, reinterpret_cast<LPCVOID>(addr),
-            &mbi, sizeof(mbi)) == sizeof(mbi)) {
-            if (mbi.State == MEM_COMMIT) {
-                MemoryRegion r;
-                r.base    = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-                r.size    = mbi.RegionSize;
-                r.protect = mbi.Protect;
-                r.state   = mbi.State;
-                r.type    = mbi.Type;
-                result.push_back(r);
-            }
-            addr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-            if (addr == 0) break; // wrapped around
-        }
-        CloseHandle(hp);
-        return result;
-    }
-
-    inline uintptr_t FindPattern(DWORD pid, uintptr_t start, size_t regionSz,
-                                  const std::vector<BYTE>& pat,
-                                  const std::vector<BYTE>& mask) {
-        std::vector<BYTE> buf(regionSz);
-        if(!Read(pid,start,buf.data(),regionSz)) return 0;
-        for(size_t i=0;i+pat.size()<=regionSz;++i) {
-            bool ok=true;
-            for(size_t j=0;j<pat.size();++j) if(mask[j]&&buf[i+j]!=pat[j]){ok=false;break;}
-            if(ok) return start+i;
-        }
-        return 0;
-    }
-
-    /// Scan all committed regions of a process for a pattern
-    inline uintptr_t FindPatternAll(DWORD pid,
-                                     const std::vector<BYTE>& pat,
-                                     const std::vector<BYTE>& mask) {
-        for (auto& region : EnumerateRegions(pid)) {
-            if (!(region.protect & PAGE_EXECUTE_READ) &&
-                !(region.protect & PAGE_EXECUTE_READWRITE) &&
-                !(region.protect & PAGE_READWRITE) &&
-                !(region.protect & PAGE_READONLY)) continue;
-            uintptr_t found = FindPattern(pid, region.base, region.size, pat, mask);
-            if (found) return found;
-        }
-        return 0;
-    }
-
-    inline bool DumpRegion(DWORD pid, uintptr_t addr, size_t sz,
-                            const std::string& path) {
-        std::vector<BYTE> buf(sz);
-        if(!Read(pid,addr,buf.data(),sz)) return false;
-        std::ofstream f(path,std::ios::binary); if(!f) return false;
-        f.write(reinterpret_cast<char*>(buf.data()),buf.size()); return f.good();
-    }
-
-    inline uintptr_t GetModuleBase(DWORD pid, const std::string& modName) {
-        HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
-        if(snap==INVALID_HANDLE_VALUE) return 0;
-        MODULEENTRY32W me{sizeof(MODULEENTRY32W)};
-        std::string low=modName;
-        std::transform(low.begin(),low.end(),low.begin(),::tolower);
-        uintptr_t base=0;
-        if(Module32FirstW(snap,&me)) do {
-            std::string mn=Str::ToNarrow(me.szModule);
-            std::transform(mn.begin(),mn.end(),mn.begin(),::tolower);
-            if(mn==low){base=reinterpret_cast<uintptr_t>(me.modBaseAddr);break;}
-        } while(Module32NextW(snap,&me));
-        CloseHandle(snap); return base;
-    }
-
-    inline std::vector<std::string> ListModules(DWORD pid) {
-        std::vector<std::string> r;
-        HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
-        if(snap==INVALID_HANDLE_VALUE) return r;
-        MODULEENTRY32W me{sizeof(MODULEENTRY32W)};
-        if(Module32FirstW(snap,&me)) do {
-            r.push_back(Str::ToNarrow(me.szExePath));
-        } while(Module32NextW(snap,&me));
-        CloseHandle(snap); return r;
-    }
-
-} // namespace Memory
 
 // ============================================================
 //  SECTION P11 — Extended Injection Techniques
 // ============================================================
 //  !! EXTREMELY DANGEROUS — RESEARCH/PERSONAL USE ONLY !!
 // ============================================================
-namespace Inject {
-
-    /// Classic LoadLibrary injection
-    inline bool InjectDLL(DWORD pid, const std::string& dllPath) {
-        Ownership::_EnablePrivilege(SE_DEBUG_NAME);
-        HANDLE hp=OpenProcess(PROCESS_ALL_ACCESS,FALSE,pid); if(!hp) return false;
-        LPVOID mem=VirtualAllocEx(hp,nullptr,dllPath.size()+1,
-            MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
-        if(!mem){CloseHandle(hp);return false;}
-        WriteProcessMemory(hp,mem,dllPath.c_str(),dllPath.size()+1,nullptr);
-        auto* ll=reinterpret_cast<LPTHREAD_START_ROUTINE>(
-            GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"LoadLibraryA"));
-        HANDLE ht=CreateRemoteThread(hp,nullptr,0,ll,mem,0,nullptr);
-        bool ok=ht!=nullptr;
-        if(ht){WaitForSingleObject(ht,5000);CloseHandle(ht);}
-        VirtualFreeEx(hp,mem,0,MEM_RELEASE); CloseHandle(hp); return ok;
-    }
-
-    /// Eject a DLL from a remote process
-    inline bool EjectDLL(DWORD pid, const std::string& moduleName) {
-        Ownership::_EnablePrivilege(SE_DEBUG_NAME);
-        uintptr_t base=Memory::GetModuleBase(pid,moduleName); if(!base) return false;
-        HANDLE hp=OpenProcess(PROCESS_ALL_ACCESS,FALSE,pid); if(!hp) return false;
-        auto* fl=reinterpret_cast<LPTHREAD_START_ROUTINE>(
-            GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"FreeLibrary"));
-        HANDLE ht=CreateRemoteThread(hp,nullptr,0,
-            fl,reinterpret_cast<LPVOID>(base),0,nullptr);
-        bool ok=ht!=nullptr;
-        if(ht){WaitForSingleObject(ht,5000);CloseHandle(ht);}
-        CloseHandle(hp); return ok;
-    }
-
-    /// Thread hijacking injection — hijack an existing thread instead of
-    /// creating a new one (less detectable than CreateRemoteThread)
-    inline bool HijackThread(DWORD pid, const std::string& dllPath) {
-        Ownership::_EnablePrivilege(SE_DEBUG_NAME);
-        // Find the first thread of the target process
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE) return false;
-        THREADENTRY32 te{ sizeof(THREADENTRY32) };
-        DWORD targetTid = 0;
-        if (Thread32First(snap, &te)) {
-            do {
-                if (te.th32OwnerProcessID == pid) { targetTid = te.th32ThreadID; break; }
-            } while (Thread32Next(snap, &te));
-        }
-        CloseHandle(snap);
-        if (!targetTid) return false;
-
-        HANDLE hp = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
-        HANDLE ht = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
-            THREAD_SUSPEND_RESUME, FALSE, targetTid);
-        if (!hp || !ht) {
-            if (hp) CloseHandle(hp);
-            if (ht) CloseHandle(ht);
-            return false;
-        }
-
-        SuspendThread(ht);
-
-        // Get thread context
-        CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_FULL;
-        GetThreadContext(ht, &ctx);
-
-        // Allocate shellcode region
-        size_t pathLen = dllPath.size() + 1;
-        LPVOID pathMem = VirtualAllocEx(hp, nullptr, pathLen,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        WriteProcessMemory(hp, pathMem, dllPath.c_str(), pathLen, nullptr);
-
-        // Build a small stub that calls LoadLibraryA then restores original RIP
-        // For simplicity, just overwrite RIP to LoadLibraryA with path arg
-        // (production code would build a proper trampoline)
-        LPTHREAD_START_ROUTINE ll = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryA"));
-
-#ifdef _WIN64
-        uintptr_t origRip = ctx.Rip;
-        ctx.Rcx = reinterpret_cast<uintptr_t>(pathMem); // arg1
-        ctx.Rip = static_cast<DWORD64>(reinterpret_cast<uintptr_t>(ll));
-#else
-        ctx.Eip = static_cast<DWORD>(reinterpret_cast<uintptr_t>(ll));
-        // Push path address onto stack
-        ctx.Esp -= sizeof(DWORD);
-        DWORD pathAddr = reinterpret_cast<DWORD>(pathMem);
-        WriteProcessMemory(hp, reinterpret_cast<LPVOID>(ctx.Esp), &pathAddr, sizeof(DWORD), nullptr);
-#endif
-        SetThreadContext(ht, &ctx);
-        ResumeThread(ht);
-        ::Sleep(200); // give it time to load
-
-        CloseHandle(ht);
-        CloseHandle(hp);
-        return true;
-    }
-
-    /// Execute raw shellcode in a remote process. !! EXTREMELY DANGEROUS !!
-    inline bool RemoteExecute(DWORD pid, const std::vector<BYTE>& shellcode) {
-        Ownership::_EnablePrivilege(SE_DEBUG_NAME);
-        HANDLE hp=OpenProcess(PROCESS_ALL_ACCESS,FALSE,pid); if(!hp) return false;
-        LPVOID mem=VirtualAllocEx(hp,nullptr,shellcode.size(),
-            MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
-        if(!mem){CloseHandle(hp);return false;}
-        WriteProcessMemory(hp,mem,shellcode.data(),shellcode.size(),nullptr);
-        HANDLE ht=CreateRemoteThread(hp,nullptr,0,
-            reinterpret_cast<LPTHREAD_START_ROUTINE>(mem),nullptr,0,nullptr);
-        bool ok=ht!=nullptr;
-        if(ht){WaitForSingleObject(ht,10000);CloseHandle(ht);}
-        VirtualFreeEx(hp,mem,0,MEM_RELEASE); CloseHandle(hp); return ok;
-    }
-
-} // namespace Inject
 
 // ============================================================
 //  SECTION P12 — WMI Quick Queries

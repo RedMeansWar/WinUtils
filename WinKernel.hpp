@@ -24,6 +24,7 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  *
+
  * ============================================================================
  * LEGAL NOTICE & ETHICAL USE POLICY
  * ============================================================================
@@ -79,20 +80,9 @@
 #ifndef WIN_KERNEL_HPP
 #define WIN_KERNEL_HPP
 
-#ifndef WIN_UTILS_HPP
-// ! WinKernel.hpp requires WinUtils.hpp — #include "WinUtils.hpp" first.
-// ! This is to avoid circular dependencies, as WinUtils.hpp contains some basic utilities
-// ! that WinKernel.hpp relies on. Please include WinUtils.hpp before including this file.
+// Dependencies — included automatically if not already present
 #include "WinUtils.hpp"
-#endif
-
-#ifndef WIN_POWER_HPP
-// ! WinPower.hpp requires WinUtils.hpp — #include "WinUtils.hpp" first.
-// ! This is to avoid circular dependencies, as WinUtils.hpp contains some basic utilities
-// ! that WinPower.hpp relies on. Please include WinUtils.hpp before including this file.
 #include "WinPower.hpp"
-#endif
-
 
 #include <winternl.h>
 #include <intrin.h>
