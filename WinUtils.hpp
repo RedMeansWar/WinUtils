@@ -43,8 +43,11 @@
  * Companion: WinPower.hpp (low-level / admin features)
  * Reference: See README.md for full namespace and function documentation
  *
+ * "Just Monika." — DDLC
+ *
  * ============================================================================
  */
+
 
 #pragma once
 #ifndef WIN_UTILS_HPP
@@ -75,7 +78,6 @@
 #include <comdef.h>
 #include <wbemidl.h>
 #include <winioctl.h>
-#include <WinSock2.h>
 
 // ---- Standard headers ----
 #include <string>
@@ -92,6 +94,7 @@
 #include <map>
 #include <cmath>
 #include <intrin.h>
+#include <winsock2.h>
 
 // ---- Pragma comments (auto-link) ----
 #pragma comment(lib, "user32.lib")
@@ -249,61 +252,180 @@ namespace Dialog {
 
     /// Show an input dialog using a quick InputBox (via VBScript / fallback: returns empty)
     /// NOTE: This spins up a tiny VBScript process as Win32 has no native InputBox.
-    inline std::string InputBox(const std::string& prompt, const std::string& title = "Input", const std::string& defaultValue = "") {
-        char tmpPath[MAX_PATH], tmpFile[MAX_PATH];
-        GetTempPathA(MAX_PATH, tmpPath);
-        GetTempFileNameA(tmpPath, "ib_", 0, tmpFile);
-        std::string vbsPath = std::string(tmpFile) + ".vbs";
-        std::string outPath = std::string(tmpFile) + ".txt";
+    // Internal Win32 input dialog — no VBScript, no temp files
+    namespace _InputBox {
+        struct Data {
+            std::wstring prompt;
+            std::wstring title;
+            std::wstring defaultValue;
+            std::wstring result;
+        };
 
-        // Replace newlines with VBScript Chr(10) concatenation
-        // so they don't break the string literal
-        std::string safePrompt = Str::ReplaceAll(prompt, "\"", "\"\"");
-        // Split on \n and join with Chr(10)
-        std::string vbsPrompt;
-        std::istringstream ss(safePrompt);
-        std::string part;
-        bool first = true;
-        while (std::getline(ss, part)) {
-            if (!first) vbsPrompt += "\" & Chr(10) & \"";
-            vbsPrompt += part;
-            first = false;
-        }
-
-        std::string safeTitle   = Str::ReplaceAll(title,        "\"", "\"\"");
-        std::string safeDefault = Str::ReplaceAll(defaultValue,  "\"", "\"\"");
-
-        // Fix backslashes in output path for VBScript
-        std::string vbsOutPath = Str::ReplaceAll(outPath, "\\", "\\\\");
-
-        std::ofstream vbs(vbsPath);
-        vbs << "Dim r\n"
-            << "r = InputBox(\"" << vbsPrompt << "\", \""
-            << safeTitle << "\", \"" << safeDefault << "\")\n"
-            << "Open \"" << vbsOutPath << "\" For Output As #1\n"
-            << "Print #1, r\n"
-            << "Close #1\n";
-        vbs.close();
-
-        ShellExecuteA(nullptr, "open", "wscript.exe",
-            vbsPath.c_str(), nullptr, SW_HIDE);
-
-        // Wait up to 5 minutes (user might be slow to type)
-        for (int i = 0; i < 3000; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            std::ifstream f(outPath);
-            if (f.good()) {
-                std::string line;
-                std::getline(f, line);
-                f.close();
-                DeleteFileA(vbsPath.c_str());
-                DeleteFileA(outPath.c_str());
-                DeleteFileA(tmpFile);
-                return Str::Trim(line);
+        inline INT_PTR CALLBACK DlgProc(HWND hDlg, UINT msg,
+            WPARAM wp, LPARAM lp) {
+            switch (msg) {
+                case WM_INITDIALOG: {
+                    auto* d = reinterpret_cast<Data*>(lp);
+                    SetWindowLongPtrW(hDlg, GWLP_USERDATA,
+                        reinterpret_cast<LONG_PTR>(d));
+                    SetWindowTextW(hDlg, d->title.c_str());
+                    SetDlgItemTextW(hDlg, 101, d->prompt.c_str());
+                    SetDlgItemTextW(hDlg, 102, d->defaultValue.c_str());
+                    // Size and center the dialog
+                    RECT rc{}; GetWindowRect(hDlg, &rc);
+                    int w = rc.right - rc.left;
+                    int h = rc.bottom - rc.top;
+                    int sw = GetSystemMetrics(SM_CXSCREEN);
+                    int sh = GetSystemMetrics(SM_CYSCREEN);
+                    SetWindowPos(hDlg, HWND_TOPMOST,
+                        (sw-w)/2, (sh-h)/2, 0, 0,
+                        SWP_NOSIZE | SWP_NOZORDER);
+                    return TRUE;
+                }
+                case WM_COMMAND: {
+                    auto* d = reinterpret_cast<Data*>(
+                        GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+                    if (LOWORD(wp) == IDOK) {
+                        wchar_t buf[1024] = {};
+                        GetDlgItemTextW(hDlg, 102, buf, 1024);
+                        if (d) d->result = buf;
+                        EndDialog(hDlg, IDOK);
+                    } else if (LOWORD(wp) == IDCANCEL) {
+                        EndDialog(hDlg, IDCANCEL);
+                    }
+                    return TRUE;
+                }
             }
+            return FALSE;
         }
-        DeleteFileA(vbsPath.c_str());
-        DeleteFileA(tmpFile);
+
+        // Build dialog template in memory — no .rc file needed
+        inline std::vector<BYTE> BuildTemplate(
+            const std::wstring& prompt,
+            const std::wstring& defaultVal) {
+            // We create a simple dialog with:
+            //   STATIC control (prompt text) id=101
+            //   EDIT control (input)         id=102
+            //   OK button                    id=IDOK
+            //   Cancel button                id=IDCANCEL
+
+            // Count lines in prompt to size dialog height
+            int lines = 1;
+            for (wchar_t c : prompt) if (c == L'\n') ++lines;
+            int dlgH = 60 + lines * 14 + 30; // base + prompt + input + buttons
+            int dlgW = 300;
+
+            struct DLGTEMPLATEEX_HEADER {
+                WORD  dlgVer, signature;
+                DWORD helpID, exStyle, style;
+                WORD  cDlgItems;
+                short x, y, cx, cy;
+            };
+
+            std::vector<BYTE> buf;
+            auto align4 = [&]() {
+                while (buf.size() % 4) buf.push_back(0);
+            };
+            auto writeW = [&](WORD v) {
+                buf.push_back(v & 0xFF);
+                buf.push_back((v >> 8) & 0xFF);
+            };
+            auto writeDW = [&](DWORD v) {
+                for (int i = 0; i < 4; ++i)
+                    buf.push_back((v >> (i*8)) & 0xFF);
+            };
+            auto writeStr = [&](const std::wstring& s) {
+                for (wchar_t c : s) {
+                    buf.push_back(c & 0xFF);
+                    buf.push_back((c >> 8) & 0xFF);
+                }
+                buf.push_back(0); buf.push_back(0); // null terminator
+            };
+
+            // Dialog header (DLGTEMPLATEEX)
+            writeW(1);      // dlgVer
+            writeW(0xFFFF); // signature
+            writeDW(0);     // helpID
+            writeDW(0);     // exStyle
+            writeDW(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME |
+                    DS_SETFONT | DS_CENTER);
+            writeW(4);      // item count
+            writeW(0); writeW(0); // x, y (centered by DS_CENTER)
+            writeW((WORD)dlgW); writeW((WORD)dlgH);
+            writeW(0);      // menu (none)
+            writeW(0);      // dialog class (default)
+            writeStr(L""); // title (set in WM_INITDIALOG)
+            // Font
+            writeW(9);      // point size
+            writeW(FW_NORMAL);
+            writeW(0);      // italic, charset
+            writeStr(L"Segoe UI");
+
+            // Helper to add a control
+            auto addControl = [&](DWORD exStyle, DWORD style,
+                short x, short y, short cx, short cy,
+                WORD id, const wchar_t* cls, const std::wstring& text) {
+                align4();
+                writeDW(0);         // helpID
+                writeDW(exStyle);
+                writeDW(style);
+                writeW(x); writeW(y); writeW(cx); writeW(cy);
+                writeDW(id);        // control ID (DWORD in DLGITEMTEMPLATEEX)
+                // Window class
+                writeW(0xFFFF);
+                if (std::wstring(cls) == L"BUTTON")      writeW(0x0080);
+                else if (std::wstring(cls) == L"EDIT")   writeW(0x0081);
+                else if (std::wstring(cls) == L"STATIC") writeW(0x0082);
+                else writeStr(cls);
+                writeStr(text);
+                writeW(0); // extra data
+            };
+
+            int promptH = lines * 14 + 4;
+            // Static prompt text
+            addControl(0, WS_VISIBLE | WS_CHILD | SS_LEFT,
+                8, 8, (short)(dlgW-16), (short)promptH,
+                101, L"STATIC", prompt);
+            // Edit box
+            addControl(WS_EX_CLIENTEDGE,
+                WS_VISIBLE | WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
+                8, (short)(8+promptH+4), (short)(dlgW-16), 14,
+                102, L"EDIT", defaultVal);
+            // OK button
+            addControl(0,
+                WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                (short)(dlgW-160), (short)(dlgH-22), 70, 14,
+                IDOK, L"BUTTON", L"OK");
+            // Cancel button
+            addControl(0,
+                WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+                (short)(dlgW-82), (short)(dlgH-22), 70, 14,
+                IDCANCEL, L"BUTTON", L"Cancel");
+
+            return buf;
+        }
+    } // namespace _InputBox
+
+    inline std::string InputBox(const std::string& prompt,
+        const std::string& title = "Input",
+        const std::string& defaultValue = "") {
+
+        _InputBox::Data data;
+        data.prompt       = Str::ToWide(prompt);
+        data.title        = Str::ToWide(title);
+        data.defaultValue = Str::ToWide(defaultValue);
+
+        auto tmpl = _InputBox::BuildTemplate(data.prompt, data.defaultValue);
+
+        INT_PTR result = DialogBoxIndirectParamW(
+            GetModuleHandleW(nullptr),
+            reinterpret_cast<LPCDLGTEMPLATEW>(tmpl.data()),
+            nullptr,
+            _InputBox::DlgProc,
+            reinterpret_cast<LPARAM>(&data));
+
+        if (result == IDOK)
+            return Str::ToNarrow(data.result);
         return {};
     }
 
