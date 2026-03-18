@@ -44,7 +44,7 @@
  * Reference: See README.md for full namespace and function documentation
  *
  * ============================================================================
-*/
+ */
 
 #pragma once
 #ifndef WIN_UTILS_HPP
@@ -75,6 +75,7 @@
 #include <comdef.h>
 #include <wbemidl.h>
 #include <winioctl.h>
+#include <WinSock2.h>
 
 // ---- Standard headers ----
 #include <string>
@@ -91,7 +92,6 @@
 #include <map>
 #include <cmath>
 #include <intrin.h>
-#include <winsock2.h>
 
 // ---- Pragma comments (auto-link) ----
 #pragma comment(lib, "user32.lib")
@@ -250,29 +250,52 @@ namespace Dialog {
     /// Show an input dialog using a quick InputBox (via VBScript / fallback: returns empty)
     /// NOTE: This spins up a tiny VBScript process as Win32 has no native InputBox.
     inline std::string InputBox(const std::string& prompt, const std::string& title = "Input", const std::string& defaultValue = "") {
-        // Write temp vbs
         char tmpPath[MAX_PATH], tmpFile[MAX_PATH];
         GetTempPathA(MAX_PATH, tmpPath);
-        GetTempFileNameA(tmpPath, "wu_", 0, tmpFile);
+        GetTempFileNameA(tmpPath, "ib_", 0, tmpFile);
         std::string vbsPath = std::string(tmpFile) + ".vbs";
         std::string outPath = std::string(tmpFile) + ".txt";
+
+        // Replace newlines with VBScript Chr(10) concatenation
+        // so they don't break the string literal
+        std::string safePrompt = Str::ReplaceAll(prompt, "\"", "\"\"");
+        // Split on \n and join with Chr(10)
+        std::string vbsPrompt;
+        std::istringstream ss(safePrompt);
+        std::string part;
+        bool first = true;
+        while (std::getline(ss, part)) {
+            if (!first) vbsPrompt += "\" & Chr(10) & \"";
+            vbsPrompt += part;
+            first = false;
+        }
+
+        std::string safeTitle   = Str::ReplaceAll(title,        "\"", "\"\"");
+        std::string safeDefault = Str::ReplaceAll(defaultValue,  "\"", "\"\"");
+
+        // Fix backslashes in output path for VBScript
+        std::string vbsOutPath = Str::ReplaceAll(outPath, "\\", "\\\\");
+
         std::ofstream vbs(vbsPath);
         vbs << "Dim r\n"
-            << "r = InputBox(\"" << Str::ReplaceAll(prompt, "\"", "\"\"") << "\", \""
-            << Str::ReplaceAll(title, "\"", "\"\"") << "\", \""
-            << Str::ReplaceAll(defaultValue, "\"", "\"\"") << "\")\n"
-            << "Open \"" << Str::ReplaceAll(outPath, "\\", "\\") << "\" For Output As #1\n"
+            << "r = InputBox(\"" << vbsPrompt << "\", \""
+            << safeTitle << "\", \"" << safeDefault << "\")\n"
+            << "Open \"" << vbsOutPath << "\" For Output As #1\n"
             << "Print #1, r\n"
             << "Close #1\n";
         vbs.close();
-        ShellExecuteA(nullptr, "open", "wscript.exe", vbsPath.c_str(), nullptr, SW_HIDE);
-        // Wait for output
-        for (int i = 0; i < 100; ++i) {
+
+        ShellExecuteA(nullptr, "open", "wscript.exe",
+            vbsPath.c_str(), nullptr, SW_HIDE);
+
+        // Wait up to 5 minutes (user might be slow to type)
+        for (int i = 0; i < 3000; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             std::ifstream f(outPath);
             if (f.good()) {
                 std::string line;
                 std::getline(f, line);
+                f.close();
                 DeleteFileA(vbsPath.c_str());
                 DeleteFileA(outPath.c_str());
                 DeleteFileA(tmpFile);
