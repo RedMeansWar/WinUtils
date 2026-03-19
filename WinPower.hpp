@@ -101,6 +101,11 @@
 #include <wbemidl.h>
 #pragma comment(lib, "wbemuuid.lib")
 
+// -- Bit Maniulation Definitions --
+#define HAS_FLAG(value, flag)       (((value) & (flag)) == (flag))
+#define ADD_FLAG(value, flag)       ((value) |= (flag))
+#define REMOVE_FLAG(value, flag)    ((value) &= ~(flag))
+
 namespace WinUtils {
 
 // ============================================================

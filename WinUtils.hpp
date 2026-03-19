@@ -43,10 +43,8 @@
  * Companion: WinPower.hpp (low-level / admin features)
  * Reference: See README.md for full namespace and function documentation
  *
- * "Just Monika." — DDLC
- *
  * ============================================================================
- */
+*/
 
 
 #pragma once
@@ -60,6 +58,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -93,8 +92,8 @@
 #include <algorithm>
 #include <map>
 #include <cmath>
-#include <intrin.h>
 #include <winsock2.h>
+#include <intrin.h>
 
 // ---- Pragma comments (auto-link) ----
 #pragma comment(lib, "user32.lib")
@@ -109,6 +108,45 @@
 #pragma comment(lib, "wbemuuid.lib")
 
 namespace WinUtils {
+
+// ============================================================
+//  Internal Utilities — available to all of WinUtils
+// ============================================================
+namespace Internal {
+
+    /// RAII scope guard — runs a function when it goes out of scope.
+    /// Guarantees cleanup even on early return or exception.
+    ///
+    /// Example:
+    ///   HANDLE h = OpenProcess(...);
+    ///   auto guard = WinUtils::Internal::MakeScopeGuard([&]{ CloseHandle(h); });
+    ///
+    /// Or with the macro:
+    ///   SCOPE_EXIT { CloseHandle(h); });
+    template <typename F>
+    struct ScopeGuard {
+        F f;
+        bool active = true;
+        ScopeGuard(F f) : f(std::move(f)) {}
+        ~ScopeGuard() { if (active) f(); }
+
+        /// Call Dismiss() if the operation succeeded and cleanup is not needed
+        void Dismiss() { active = false; }
+
+        ScopeGuard(const ScopeGuard&) = delete;
+        ScopeGuard& operator=(const ScopeGuard&) = delete;
+        ScopeGuard(ScopeGuard&&) = default;
+    };
+
+    template <typename F>
+    ScopeGuard<F> MakeScopeGuard(F f) { return ScopeGuard<F>(std::move(f)); }
+
+} // namespace Internal
+
+/// Convenience macro — SCOPE_EXIT { cleanup code; });
+/// Works like Go's defer — runs at end of scope regardless of how you exit
+#define SCOPE_EXIT \
+    auto _scope_guard_##__LINE__ = ::WinUtils::Internal::MakeScopeGuard([&]()
 
 // ============================================================
 //  SECTION 1 — String Utilities
@@ -3377,14 +3415,4 @@ namespace EncryptGCM {
 //  Notify     Audio         Log           Hotkey        Screen
 //  Net        Crypto        Ini           Console       Progress
 //  Tray       Drive         FileAttr      Encrypt       EncryptGCM
-// ============================================================
-
-// ============================================================
-//  QUICK REFERENCE — WinUtils.hpp
-// ============================================================
-//  Str        Dialog        File          Mouse         Keyboard
-//  Clipboard  Process       Window        System        Registry
-//  Notify     Audio         Log           Hotkey        Screen
-//  Net        Crypto        Ini           Console       Progress
-//  Tray       Drive         FileAttr      Encrypt
 // ============================================================
