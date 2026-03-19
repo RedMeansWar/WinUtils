@@ -65,38 +65,7 @@
 #include <windows.h>
 #endif
 
-// Colors that aren't defined in Windows headers are listed here for convenience. These can be used with SetConsoleTextAttribute for colored console output.
-#define FOREGROUND_BLUE             0x0001
-#define FOREGROUND_GREEN            0x0002
-#define FOREGROUND_RED              0x0004
-#define FOREGROUND_INTENSITY        0x0008
-#define FOREGROUND_YELLOW           (FOREGROUND_RED | FOREGROUND_GREEN)
-#define FOREGROUND_CYAN             (FOREGROUND_GREEN | FOREGROUND_BLUE)
-#define FOREGROUND_MAGENTA          (FOREGROUND_RED | FOREGROUND_BLUE)
-#define FOREGROUND_WHITE            (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
-
-#define FOREGROUND_BRIGHT_RED       (FOREGROUND_RED | FOREGROUND_INTENSITY)
-#define FOREGROUND_BRIGHT_GREEN     (FOREGROUND_GREEN | FOREGROUND_INTENSITY)
-#define FOREGROUND_BRIGHT_BLUE      (FOREGROUND_BLUE | FOREGROUND_INTENSITY)
-#define FOREGROUND_BRIGHT_MAGENTA   (FOREGROUND_MAGENTA | FOREGROUND_INTENSITY)
-#define FOREGROUND_BRIGHT_WHITE     (FOREGROUND_WHITE | FOREGROUND_INTENSITY)
-
-#define BACKGROUND_BLUE             0x0010
-#define BACKGROUND_GREEN            0x0020
-#define BACKGROUND_RED              0x0040
-#define BACKGROUND_INTENSITY        0x0080
-#define BACKGROUND_YELLOW           (BACKGROUND_RED | BACKGROUND_GREEN)
-#define BACKGROUND_CYAN             (BACKGROUND_GREEN | BACKGROUND_BLUE)
-#define BACKGROUND_MAGENTA          (BACKGROUND_RED | BACKGROUND_BLUE)
-#define BACKGROUND_WHITE            (BACKGROUND_RED | BACKGROUND_GREEN | BACKGROUND_BLUE)
-
-#define COLOR_WARNING_THEME         (BACKGROUND_YELLOW | FOREGROUND_INTENSITY)
-#define COMMON_LVB_REVERSE_VIDEO    0x4000
-#define COMMON_LVB_UNDERSCORE       0x8000
-#define CONSOLE_RESET               (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
-
 namespace WinMath {
-
 // ============================================================
 //  Constants
 // ============================================================
