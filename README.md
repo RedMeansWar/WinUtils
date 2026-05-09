@@ -132,8 +132,6 @@ and system administrators — not to enable harm.
 
 ---
 
----
-
 ## Requirements
 
 - Windows (Win32 API), C++17 or later
