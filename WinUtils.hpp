@@ -46,7 +46,6 @@
  * ============================================================================
 */
 
-
 #pragma once
 #ifndef WIN_UTILS_HPP
 #define WIN_UTILS_HPP
@@ -55,6 +54,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -3436,13 +3436,3 @@ namespace EncryptGCM {
 } // namespace WinUtils
 
 #endif // WIN_UTILS_HPP
-
-// ============================================================
-//  QUICK REFERENCE — WinUtils.hpp
-// ============================================================
-//  Str        Dialog        File          Mouse         Keyboard
-//  Clipboard  Process       Window        System        Registry
-//  Notify     Audio         Log           Hotkey        Screen
-//  Net        Crypto        Ini           Console       Progress
-//  Tray       Drive         FileAttr      Encrypt       EncryptGCM
-// ============================================================

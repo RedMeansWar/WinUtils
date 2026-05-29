@@ -681,36 +681,3 @@ namespace NetConfig {
 } // namespace WinUtils
 
 #endif // WIN_EXTRA_HPP
-
-// ============================================================
-//  QUICK REFERENCE — WinExtra.hpp
-// ============================================================
-//
-//  Mutex::       Create, EnforceSingleInstance, Release, IsRunning
-//
-//  Pipe::        CreateServer, WaitForClient, Connect, Send,
-//                Receive, Close, QuickSend
-//
-//  EventLog::    Write, Read, Clear
-//
-//  Firewall::    AllowProgram, AllowPort, RemoveRule, SetEnabled
-//                (requires Admin)
-//
-//  Scheduler::   CreateStartupTask, DeleteTask, TaskExists
-//                (requires Admin for system tasks)
-//
-//  Theme::       IsDarkMode, SetDarkMode, GetAccentColor,
-//                GetWallpaper, SetWallpaper, GetSystemDPI,
-//                IsTransparencyEnabled, SetTransparencyEnabled,
-//                GetCurrentTheme
-//
-//  PowerMgmt::   PreventSleep, AllowSleep, Sleep, Hibernate,
-//                GetPowerPlans, SetPowerPlan,
-//                SetHighPerformance, SetBalanced, SetPowerSaver,
-//                GetActivePlanName, IsPluggedIn
-//
-//  NetConfig::   GetHostname, FlushDNS, RenewDHCP,
-//                ResetTCPIP, ResetWinsock,
-//                IsPortOpen, GetPublicIP
-//
-// ============================================================

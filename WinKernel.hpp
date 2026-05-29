@@ -532,28 +532,3 @@ namespace AntiCheat {
 } // namespace WinUtils
 
 #endif // WIN_KERNEL_HPP
-
-// ============================================================
-//  QUICK REFERENCE — WinKernel.hpp
-// ============================================================
-//
-//  Driver::      Load, Unload, Open, SendIOCTL,
-//                DriverHandle (RAII), IsLoaded
-//
-//  AntiCheat::   ScanModules(whitelist)
-//                CheckSelfIntegrity(expectedHash)
-//                GetSelfHash()
-//                WatchMemoryRegion(addr, size, onTamper, running)
-//                SpeedHackDetector .Check() / .CheckTickDrift()
-//                DetectOverlays()
-//                DetectTransparentOverlay()
-//                IsRunningInVM()
-//                DetectVMRegistry()
-//                DetectVMProcesses()
-//                IsVirtualEnvironment()
-//                DetectSingleStep()
-//                DetectTimeManipulation()
-//                RunFullScan(whitelist, expectedHash) -> ScanResult
-//                IsCheating(scanResult)
-//
-// ============================================================

@@ -1102,38 +1102,3 @@ namespace Board {
 } // namespace WinUtils
 
 #endif // WIN_HARDWARE_HPP
-
-// ============================================================
-//  QUICK REFERENCE — WinHardware.hpp
-// ============================================================
-//
-//  CPU::       GetInfo, GetName, GetCoreCount, GetLogicalCount,
-//              GetMaxClockMHz, GetUsagePercent, GetPerCoreUsage,
-//              GetTemperatureCelsius
-//
-//  GPU::       GetAll, GetName, GetVRAM_GB, GetCurrentMode
-//
-//  RAM::       GetSticks, GetTotalGB, GetAvailableGB,
-//              GetUsagePercent, GetTypeString, GetSpeedMHz
-//
-//  Disk::      GetAll, GetPartitions, GetReadWriteSpeed
-//
-//  Monitor::   GetAll, GetPrimaryResolution, GetPrimaryRefreshHz,
-//              GetDPI, GetScaleFactor, GetVirtualDesktopSize
-//
-//  NetInfo::   GetAll, GetThroughput, Ping
-//
-//  Devices::   GetUSBDevices, GetPrinters, GetAllPnPDeviceNames
-//
-//  Battery::   GetInfo, GetPercent, IsCharging, HasBattery
-//
-//  Software::  GetInstalled, IsInstalled
-//
-//  ProcessInfo:: GetAll, GetByPID, GetTopByRAM
-//
-//  Sensors::   GetThermalZones, GetUptimeSeconds, GetUptimeString,
-//              GetPageFileUsageMB
-//
-//  Board::     GetBIOS, GetMotherboard, GetWindowsSerial, GetMachineUUID
-//
-// ============================================================
