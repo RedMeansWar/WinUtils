@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * WinHardware.hpp
+ * winhardware.hpp
  * Part of the WinUtils project — Hardware & system information queries
  * ============================================================================
  *
@@ -36,17 +36,17 @@
  *
  * ============================================================================
  *
- * Requires : Windows (Win32 API), C++17 or later, WinUtils.hpp
+ * Requires : Windows (Win32 API), C++17 or later, winutils.hpp
  * Reference: See README.md for full documentation
  *
  * ============================================================================
 */
 
 #pragma once
-#ifndef WIN_HARDWARE_HPP
-#define WIN_HARDWARE_HPP
+#ifndef WINUTILS_HARDWARE_HPP
+#define WINUTILS_HARDWARE_HPP
 
-#include "WinUtils.hpp"
+#include "winutils.hpp"
 
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -1101,4 +1101,4 @@ namespace Board {
 
 } // namespace WinUtils
 
-#endif // WIN_HARDWARE_HPP
+#endif // WINUTILS_HARDWARE_HPP

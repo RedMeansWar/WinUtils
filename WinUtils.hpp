@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * WinUtils.hpp
+ * winutils.hpp
  * Part of the WinUtils project — A comprehensive Windows utility header library
  * ============================================================================
  *
@@ -47,8 +47,11 @@
 */
 
 #pragma once
-#ifndef WIN_UTILS_HPP
-#define WIN_UTILS_HPP
+#ifndef WINUTILS_HPP
+#define WINUTILS_HPP
+
+// ---- Required Headers ----
+#include "wincompat.hpp"
 
 // ---- Windows headers ----
 #ifndef WIN32_LEAN_AND_MEAN
@@ -3435,4 +3438,4 @@ namespace EncryptGCM {
 
 } // namespace WinUtils
 
-#endif // WIN_UTILS_HPP
+#endif // WINUTILS_HPP

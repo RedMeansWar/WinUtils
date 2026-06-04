@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * WinExtra.hpp
+ * winextra.hpp
  * Part of the WinUtils project — Extended Windows utility namespaces
  * ============================================================================
  *
@@ -34,17 +34,17 @@
  *
  * ============================================================================
  *
- * Requires : Windows (Win32 API), C++17 or later, WinUtils.hpp
+ * Requires : Windows (Win32 API), C++17 or later, winutils.hpp
  * Reference: See README.md for full documentation
  *
  * ============================================================================
 */
 
 #pragma once
-#ifndef WIN_EXTRA_HPP
-#define WIN_EXTRA_HPP
+#ifndef WINUTILS_EXTRA_HPP
+#define WINUTILS_EXTRA_HPP
 
-#include "WinUtils.hpp"
+#include "winutils.hpp"
 
 #include <netfw.h>
 #include <taskschd.h>
@@ -680,4 +680,4 @@ namespace NetConfig {
 
 } // namespace WinUtils
 
-#endif // WIN_EXTRA_HPP
+#endif // WINUTILS_EXTRA_HPP

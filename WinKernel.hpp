@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * WinKernel.hpp
+ * winkernel.hpp
  * Part of the WinUtils project — Kernel driver interface & anti-cheat
  * ============================================================================
  *
@@ -70,19 +70,19 @@
  *
  * ============================================================================
  *
- * Requires : Windows (Win32 API), C++17 or later, WinUtils.hpp, WinPower.hpp
+ * Requires : Windows (Win32 API), C++17 or later, winutils.hpp, winpower.hpp
  * Reference: See README.md for full documentation
  *
  * ============================================================================
 */
 
 #pragma once
-#ifndef WIN_KERNEL_HPP
-#define WIN_KERNEL_HPP
+#ifndef WINUTILS_KERNEL_HPP
+#define WINUTILS_KERNEL_HPP
 
 // Dependencies — included automatically if not already present
-#include "WinUtils.hpp"
-#include "WinPower.hpp"
+#include "winutils.hpp"
+#include "winpower.hpp"
 
 #include <winternl.h>
 #include <intrin.h>
@@ -531,4 +531,4 @@ namespace AntiCheat {
 
 } // namespace WinUtils
 
-#endif // WIN_KERNEL_HPP
+#endif // WINUTILS_KERNEL_HPP

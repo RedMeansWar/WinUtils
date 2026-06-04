@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * WinAudio.hpp
+ * winaudio.hpp
  * Part of the WinUtils project — Windows Audio utility namespace
  * ============================================================================
  *
@@ -37,7 +37,7 @@
  *
  * ============================================================================
  *
- * Requires : Windows Vista or later (WASAPI), C++17 or later, WinUtils.hpp
+ * Requires : Windows Vista or later (WASAPI), C++17 or later, winutils.hpp
  * Qt compat: Define WINUTILS_AUDIO_QT before including to enable Q_GADGET
  *            registration and Q_PROPERTY macros on AudioDevice. Requires Qt6
  *            headers to be available on the include path.
@@ -52,10 +52,10 @@
 */
 
 #pragma once
-#ifndef WIN_AUDIO_HPP
-#define WIN_AUDIO_HPP
+#ifndef WINUTILS_AUDIO_HPP
+#define WINUTILSAUDIO_HPP
 
-#include "WinUtils.hpp"
+#include "winutils.hpp"
 
 // ---- WASAPI / MMDevice Headers ----
 #include <mmdeviceapi.h>
@@ -872,4 +872,4 @@ namespace WinUtils::Audio {
 }
 #endif
  
-#endif // WIN_AUDIO_HPP
+#endif // WINUTILS_AUDIO_HPP

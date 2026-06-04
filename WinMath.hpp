@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * WinMath.hpp
+ * winmath.hpp
  * Part of the WinUtils project — Mathematics Utility Library
  * ============================================================================
  *
@@ -44,8 +44,8 @@
 */
 
 #pragma once
-#ifndef WIN_MATH_HPP
-#define WIN_MATH_HPP
+#ifndef WINUTILS_MATH_HPP
+#define WINUTILS_MATH_HPP
 
 #include <cmath>
 #include <algorithm>
@@ -1283,4 +1283,4 @@ namespace Screen {
 
 } // namespace WinMath
 
-#endif // WIN_MATH_HPP
+#endif // WINUTILS_MATH_HPP

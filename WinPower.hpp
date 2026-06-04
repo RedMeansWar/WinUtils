@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * WinPower.hpp
+ * winpower.hpp
  * Part of the WinUtils project — Low-level Windows power utilities
  * ============================================================================
  *
@@ -75,18 +75,18 @@
  *
  * ============================================================================
  *
- * Requires : Windows (Win32 API), C++17 or later, WinUtils.hpp
+ * Requires : Windows (Win32 API), C++17 or later, winutils.hpp
  * Reference: See README.md for full namespace and function documentation
  *
  * ============================================================================
 */
 
 #pragma once
-#ifndef WIN_POWER_HPP
-#define WIN_POWER_HPP
+#ifndef WINUTILS_POWER_HPP
+#define WINUTILS_POWER_HPP
 
-// WinUtils.hpp is required — include it automatically if not already included
-#include "WinUtils.hpp"
+// winutils.hpp is required — include it automatically if not already included
+#include "winutils.hpp"
 
 #include <winternl.h>
 #include <processthreadsapi.h>
@@ -1604,4 +1604,4 @@ namespace WMI {
 
 } // namespace WinUtils
 
-#endif // WIN_POWER_HPP
+#endif // WINUTILS_POWER_HPP
