@@ -118,7 +118,7 @@ namespace WinUtils {
 namespace Ownership {
 
     /// Enable a named privilege in the current process token.
-    inline bool _EnablePrivilege(LPCWSTR name) {
+    inline bool  _EnablePrivilege(LPCWSTR name) {
         HANDLE hToken = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(),
             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return false;
@@ -132,6 +132,10 @@ namespace Ownership {
                   && GetLastError() == ERROR_SUCCESS;
         CloseHandle(hToken);
         return ok;
+    }
+
+    inline bool _EnablePrivilege(const char* name) {
+        return _EnablePrivilege(Str::ToWide(name).c_str());
     }
 
     /// Enable all privileges commonly needed for ownership/ACL work

@@ -67,3 +67,8 @@
 #include "winsecurity.hpp"
 #include "winkernel.hpp"
 #include "winextra.hpp"
+#include "winconsole.hpp"
+#include "winevent.hpp"
+#include "winnet2.hpp"
+#include "winpipe.hpp"
+#include "winthread.hpp"

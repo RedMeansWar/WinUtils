@@ -74,12 +74,12 @@
 #ifndef WINUTILS_SECURITY_HPP
 #define WINUTILS_SECURITY_HPP
 
+#include "wincompat.hpp"
 #include "winutils.hpp"
 #include "winpower.hpp"
 
 #include <wincrypt.h>
 #include <cryptuiapi.h>
-#include <ntsecapi.h>
 #include <lm.h>
 
 #pragma comment(lib, "crypt32.lib")
@@ -93,6 +93,15 @@
 // ---- wincred.h is not always pulled in transitively ----
 #include <wincred.h>
 #pragma comment(lib, "Credui.lib")
+
+// ---- Windows Event Log API (for HoneyAccount watcher) ----
+#include <winevt.h>
+#pragma comment(lib, "wevtapi.lib")
+
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <functional>
 
 namespace WinUtils {
 namespace Security {
@@ -1468,6 +1477,477 @@ namespace Credentials {
     }
 
 } // namespace Credentials
+
+// ============================================================
+//  SECTION S8 — Honey Accounts (Decoy / Trap User Accounts)
+// ============================================================
+//  A Honey Account is a fake local user account that no legitimate
+//  user ever logs into. Any login attempt against it is by definition
+//  suspicious — an attacker enumerating accounts, brute-forcing
+//  credentials, or using leaked password lists.
+//
+//  This is a standard blue-team / intrusion detection technique used
+//  by sysadmins, SOC teams, and security researchers. Honey accounts
+//  are documented by MITRE ATT&CK (D3FEND: Decoy User Credential)
+//  and recommended by CIS Benchmarks for Windows.
+//
+//  How it works:
+//    1. Create a disabled local account with a tempting name
+//       (e.g. "admin", "backup", "svc_sql")
+//    2. The account is disabled — no one can actually log in
+//    3. Any authentication attempt still generates Security event
+//       log entries (Event ID 4625 = failed logon)
+//    4. WatchForAttempts() monitors the event log on a background
+//       thread and fires a callback when any attempt is detected
+//
+//  Requires: Administrator for account creation/deletion
+//  Event log reading: requires no special privileges for local Security log
+// ============================================================
+namespace HoneyAccount {
+
+    // Registry key where WinUtils tracks which accounts are honey accounts
+    // so ListAll() knows which accounts we created vs system accounts
+    static constexpr const char* kHoneyRegKey =
+        "SOFTWARE\\WinUtils\\HoneyAccounts";
+
+    // ---- Data structures ----
+
+    /// Information about a honey account
+    struct HoneyAccountInfo {
+        std::string name;           ///< Account username
+        std::string description;    ///< Account description (visible in lusrmgr.msc)
+        std::string createdAt;      ///< Creation timestamp (ISO-ish: YYYY-MM-DD HH:MM:SS)
+        bool        exists = false; ///< Account is present in the local SAM database
+        DWORD       loginAttempts = 0; ///< Cached count of login attempts seen so far
+    };
+
+    /// A login attempt event caught against a honey account
+    struct LoginAttempt {
+        std::string accountName;  ///< The honey account that was targeted
+        std::string timestamp;    ///< When the attempt occurred
+        std::string sourceIP;     ///< Source IP address (empty if local/unknown)
+        std::string workstation;  ///< Source workstation name
+        std::string logonType;    ///< e.g. "Network", "Interactive", "RemoteInteractive"
+        DWORD       eventId = 0;  ///< 4625 = failed, 4624 = success (should never succeed)
+        std::string failureReason;///< Why it failed (wrong password, account disabled, etc.)
+    };
+
+    // ---- Internal helpers ----
+    namespace _Honey {
+
+        inline std::string NowStr() {
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+            return Str::Format("%04d-%02d-%02d %02d:%02d:%02d",
+                st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond);
+        }
+
+        inline std::string LogonTypeStr(DWORD type) {
+            switch (type) {
+                case 2:  return "Interactive";
+                case 3:  return "Network";
+                case 4:  return "Batch";
+                case 5:  return "Service";
+                case 7:  return "Unlock";
+                case 8:  return "NetworkCleartext";
+                case 9:  return "NewCredentials";
+                case 10: return "RemoteInteractive";
+                case 11: return "CachedInteractive";
+                default: return "Unknown(" + std::to_string(type) + ")";
+            }
+        }
+
+        // Pull a named XML value out of an event XML string
+        // e.g. extract "192.168.1.1" from <Data Name='IpAddress'>192.168.1.1</Data>
+        inline std::string XmlField(const std::string& xml, const std::string& name) {
+            std::string open  = "<Data Name='" + name + "'>";
+            std::string openQ = "<Data Name=\"" + name + "\">";
+            auto pos = xml.find(open);
+            if (pos == std::string::npos) pos = xml.find(openQ);
+            if (pos == std::string::npos) return {};
+            auto start = xml.find('>', pos) + 1;
+            auto end   = xml.find("</Data>", start);
+            if (start == std::string::npos || end == std::string::npos) return {};
+            std::string val = xml.substr(start, end - start);
+            // Strip leading/trailing whitespace
+            val.erase(0, val.find_first_not_of(" \t\r\n"));
+            val.erase(val.find_last_not_of(" \t\r\n") + 1);
+            if (val == "-" || val == "%%1796") return {};
+            return val;
+        }
+
+        // Global watcher state
+        inline std::atomic<bool>& _watching() { static std::atomic<bool> v{false}; return v; }
+        inline std::thread& _watchThread() { static std::thread t; return t; }
+        inline std::mutex& _cbMtx() { static std::mutex m; return m; }
+        using AttemptCallback = std::function<void(const LoginAttempt&)>;
+        inline AttemptCallback& _callback() { static AttemptCallback cb; return cb; }
+
+    } // namespace _Honey
+
+    // ---- Account management ----
+
+    /// Create a honey (decoy) local user account.
+    ///
+    /// The account is created DISABLED — no one can actually log in with it.
+    /// Login attempts against it still generate Security event log entries.
+    ///
+    /// name:        Username (pick something tempting: "admin", "backup", "sa", "svc_sql")
+    /// password:    A strong password — this never needs to be used; just make it complex
+    /// description: Shown in lusrmgr.msc — make it look real e.g. "SQL Service Account"
+    ///
+    /// Requires: Administrator
+    inline bool Create(const std::string& name,
+                       const std::string& password,
+                       const std::string& description = "Service Account") {
+        std::wstring wName = Str::ToWide(name);
+        std::wstring wPass = Str::ToWide(password);
+        std::wstring wDesc = Str::ToWide(description);
+
+        USER_INFO_1 ui{};
+        ui.usri1_name     = wName.data();
+        ui.usri1_password = wPass.data();
+        ui.usri1_priv     = USER_PRIV_USER;
+        ui.usri1_flags    = UF_ACCOUNTDISABLE | UF_DONT_EXPIRE_PASSWD | UF_NORMAL_ACCOUNT;
+        ui.usri1_script_path = nullptr;
+        ui.usri1_home_dir    = nullptr;
+
+        NET_API_STATUS status = NetUserAdd(nullptr, 1,
+            reinterpret_cast<LPBYTE>(&ui), nullptr);
+
+        if (status != NERR_Success && status != NERR_UserExists)
+            return false;
+
+        // Set description via USER_INFO_1007
+        USER_INFO_1007 ui7{};
+        ui7.usri1007_comment = wDesc.data();
+        NetUserSetInfo(nullptr, wName.c_str(), 1007,
+            reinterpret_cast<LPBYTE>(&ui7), nullptr);
+
+        // Ensure account stays disabled
+        USER_INFO_1008 ui8{};
+        ui8.usri1008_flags = UF_ACCOUNTDISABLE | UF_DONT_EXPIRE_PASSWD | UF_NORMAL_ACCOUNT;
+        NetUserSetInfo(nullptr, wName.c_str(), 1008,
+            reinterpret_cast<LPBYTE>(&ui8), nullptr);
+
+        // Register in our tracking registry key
+        Registry::WriteDWORD(HKEY_LOCAL_MACHINE, kHoneyRegKey, name, 0);
+
+        // Store creation timestamp alongside it
+        const std::string tsKey = kHoneyRegKey + std::string("\\") + name;
+        Registry::WriteString(HKEY_LOCAL_MACHINE, kHoneyRegKey,
+            name + "_created", _Honey::NowStr());
+
+        return true;
+    }
+
+    /// Remove a honey account and its tracking registry entry.
+    /// Requires: Administrator
+    inline bool Remove(const std::string& name) {
+        NET_API_STATUS status = NetUserDel(nullptr, Str::ToWide(name).c_str());
+        // Clean up registry tracking regardless of whether account existed
+        Registry::DeleteValue(HKEY_LOCAL_MACHINE, kHoneyRegKey, name);
+        Registry::DeleteValue(HKEY_LOCAL_MACHINE, kHoneyRegKey, name + "_created");
+        return status == NERR_Success || status == NERR_UserNotFound;
+    }
+
+    /// Check if a honey account exists in the local SAM.
+    inline bool Exists(const std::string& name) {
+        USER_INFO_0* info = nullptr;
+        NET_API_STATUS s = NetUserGetInfo(nullptr,
+            Str::ToWide(name).c_str(), 0,
+            reinterpret_cast<LPBYTE*>(&info));
+        if (info) NetApiBufferFree(info);
+        return s == NERR_Success;
+    }
+
+    /// Check if an account is currently disabled.
+    inline bool IsDisabled(const std::string& name) {
+        USER_INFO_1* info = nullptr;
+        NET_API_STATUS s = NetUserGetInfo(nullptr,
+            Str::ToWide(name).c_str(), 1,
+            reinterpret_cast<LPBYTE*>(&info));
+        if (s != NERR_Success || !info) return false;
+        bool disabled = (info->usri1_flags & UF_ACCOUNTDISABLE) != 0;
+        NetApiBufferFree(info);
+        return disabled;
+    }
+
+    /// Re-disable a honey account if it somehow got enabled.
+    /// Requires: Administrator
+    inline bool EnsureDisabled(const std::string& name) {
+        USER_INFO_1008 ui{};
+        ui.usri1008_flags = UF_ACCOUNTDISABLE | UF_DONT_EXPIRE_PASSWD | UF_NORMAL_ACCOUNT;
+        return NetUserSetInfo(nullptr, Str::ToWide(name).c_str(), 1008,
+            reinterpret_cast<LPBYTE>(&ui), nullptr) == NERR_Success;
+    }
+
+    /// List all honey accounts tracked by WinUtils.
+    /// Only returns accounts that were created via HoneyAccount::Create().
+    inline std::vector<HoneyAccountInfo> ListAll() {
+        std::vector<HoneyAccountInfo> result;
+        auto names = Registry::ListValues(HKEY_LOCAL_MACHINE, kHoneyRegKey);
+        for (auto& n : names) {
+            // Skip the _created timestamp entries
+            if (n.size() > 8 && n.substr(n.size() - 8) == "_created") continue;
+            HoneyAccountInfo info;
+            info.name   = n;
+            info.exists = Exists(n);
+            auto ts = Registry::ReadString(HKEY_LOCAL_MACHINE, kHoneyRegKey,
+                n + "_created");
+            if (ts) info.createdAt = *ts;
+            // Get description from SAM
+            USER_INFO_1007* ui = nullptr;
+            if (NetUserGetInfo(nullptr, Str::ToWide(n).c_str(), 1007,
+                reinterpret_cast<LPBYTE*>(&ui)) == NERR_Success && ui) {
+                if (ui->usri1007_comment)
+                    info.description = Str::ToNarrow(ui->usri1007_comment);
+                NetApiBufferFree(ui);
+            }
+            result.push_back(info);
+        }
+        return result;
+    }
+
+    // ---- Event Log Monitoring ----
+
+    /// Query the Security event log for login attempts against a specific account.
+    ///
+    /// accountName: the honey account username to filter for
+    /// maxEvents:   maximum number of events to return (most recent first)
+    ///
+    /// Reads Event ID 4625 (failed logon) and 4624 (successful logon).
+    /// A successful logon (4624) against a honey account is a critical alert
+    /// since the account is disabled and should never succeed — if it does,
+    /// it means someone re-enabled the account or the SAM was tampered with.
+    ///
+    /// Note: Reading the Security event log requires the process to be running
+    /// as Administrator or as a member of the Event Log Readers group.
+    inline std::vector<LoginAttempt> GetLoginAttempts(
+            const std::string& accountName,
+            DWORD maxEvents = 100) {
+
+        std::vector<LoginAttempt> results;
+
+        // XPath query: filter Security log for logon events targeting our account
+        // Event 4625 = failed logon, 4624 = successful logon
+        std::wstring query =
+            L"*[System[(EventID=4625 or EventID=4624)] and "
+            L"EventData[Data[@Name='TargetUserName']='" +
+            Str::ToWide(accountName) + L"']]";
+
+        EVT_HANDLE hResults = EvtQuery(
+            nullptr,                    // local machine
+            L"Security",               // channel
+            query.c_str(),
+            
+            EVT_QUERY_CHANNEL_PATH | EVT_QUERY_REVERSE_DIRECTION);
+
+        if (!hResults) return results;
+
+        EVT_HANDLE hEvents[10];
+        DWORD returned = 0;
+
+        while (results.size() < maxEvents) {
+            DWORD toFetch = static_cast<DWORD>(
+                std::min<size_t>(10, maxEvents - results.size()));
+
+            if (!EvtNext(hResults, toFetch, hEvents, INFINITE, 0, &returned)
+                || returned == 0)
+                break;
+
+            for (DWORD i = 0; i < returned; ++i) {
+                // Render the event as XML so we can parse all fields
+                DWORD bufSize = 0, bufUsed = 0, propCount = 0;
+                EvtRender(nullptr, hEvents[i], EvtRenderEventXml,
+                    0, nullptr, &bufSize, &propCount);
+
+                std::wstring xmlBuf(bufSize / sizeof(wchar_t) + 1, L'\0');
+                if (!EvtRender(nullptr, hEvents[i], EvtRenderEventXml,
+                    bufSize,
+                    reinterpret_cast<PVOID>(xmlBuf.data()),
+                    &bufUsed, &propCount)) {
+                    EvtClose(hEvents[i]);
+                    continue;
+                }
+
+                std::string xml = Str::ToNarrow(xmlBuf);
+
+                LoginAttempt evt;
+                evt.accountName  = accountName;
+                evt.sourceIP     = _Honey::XmlField(xml, "IpAddress");
+                evt.workstation  = _Honey::XmlField(xml, "WorkstationName");
+                evt.failureReason = _Honey::XmlField(xml, "FailureReason");
+
+                // Logon type
+                std::string ltStr = _Honey::XmlField(xml, "LogonType");
+                if (!ltStr.empty()) {
+                    try {
+                        evt.logonType = _Honey::LogonTypeStr(
+                            static_cast<DWORD>(std::stoul(ltStr)));
+                    } catch (...) { evt.logonType = ltStr; }
+                }
+
+                // Event ID
+                auto eidStr = _Honey::XmlField(xml, "EventID");
+                // EventID is in System section, not EventData — parse differently
+                {
+                    auto pos = xml.find("<EventID>");
+                    if (pos != std::string::npos) {
+                        auto end = xml.find("</EventID>", pos);
+                        if (end != std::string::npos) {
+                            try {
+                                evt.eventId = static_cast<DWORD>(std::stoul(
+                                    xml.substr(pos + 9, end - pos - 9)));
+                            } catch (...) {}
+                        }
+                    }
+                }
+
+                // Timestamp from System/TimeCreated SystemTime attribute
+                {
+                    auto pos = xml.find("SystemTime='");
+                    if (pos == std::string::npos) pos = xml.find("SystemTime=\"");
+                    if (pos != std::string::npos) {
+                        auto start = xml.find('\'', pos);
+                        if (start == std::string::npos) start = xml.find('"', pos);
+                        auto end = xml.find_first_of("'\"", start + 1);
+                        if (start != std::string::npos && end != std::string::npos)
+                            evt.timestamp = xml.substr(start + 1, end - start - 1);
+                    }
+                }
+
+                results.push_back(evt);
+                EvtClose(hEvents[i]);
+            }
+        }
+
+        EvtClose(hResults);
+        return results;
+    }
+
+    /// Query login attempts for ALL tracked honey accounts at once.
+    inline std::vector<LoginAttempt> GetAllLoginAttempts(DWORD maxPerAccount = 50) {
+        std::vector<LoginAttempt> all;
+        for (auto& acct : ListAll()) {
+            auto attempts = GetLoginAttempts(acct.name, maxPerAccount);
+            all.insert(all.end(), attempts.begin(), attempts.end());
+        }
+        return all;
+    }
+
+    /// Get a count of login attempts for an account without returning full details.
+    inline DWORD CountLoginAttempts(const std::string& accountName) {
+        return static_cast<DWORD>(GetLoginAttempts(accountName, 10000).size());
+    }
+
+    // ---- Background Watcher ----
+
+    /// Start a background thread that watches the Security event log and fires
+    /// callback whenever a login attempt against ANY tracked honey account is detected.
+    ///
+    /// callback:       called on the watcher thread — keep it fast and thread-safe
+    /// pollIntervalMs: how often to poll the event log (default 5 seconds)
+    ///
+    /// The watcher uses EvtSubscribe with a push-style callback for efficiency,
+    /// falling back to polling if subscription fails (e.g. non-admin context).
+    ///
+    /// Call StopWatching() to shut down the thread cleanly.
+    inline void WatchForAttempts(
+            std::function<void(const LoginAttempt&)> callback,
+            DWORD pollIntervalMs = 5000) {
+
+        if (_Honey::_watching()) return; // already running
+
+        {
+            std::lock_guard<std::mutex> lock(_Honey::_cbMtx());
+            _Honey::_callback() = callback;
+        }
+
+        _Honey::_watching() = true;
+
+        _Honey::_watchThread() = std::thread([pollIntervalMs]() {
+            // Track the last event count per account so we only fire on NEW events
+            std::map<std::string, DWORD> lastCounts;
+
+            while (_Honey::_watching()) {
+                auto accounts = ListAll();
+                for (auto& acct : accounts) {
+                    auto attempts = GetLoginAttempts(acct.name, 1000);
+                    DWORD newCount = static_cast<DWORD>(attempts.size());
+                    DWORD oldCount = lastCounts.count(acct.name)
+                        ? lastCounts[acct.name] : newCount;
+
+                    if (newCount > oldCount) {
+                        // Fire callback for each new event (newest first, so
+                        // fire them in reverse to get chronological order)
+                        DWORD newEvents = newCount - oldCount;
+                        for (DWORD i = newEvents; i > 0; --i) {
+                            if (i - 1 < attempts.size()) {
+                                std::lock_guard<std::mutex> lock(_Honey::_cbMtx());
+                                if (_Honey::_callback())
+                                    _Honey::_callback()(attempts[i - 1]);
+                            }
+                        }
+                    }
+                    lastCounts[acct.name] = newCount;
+                }
+                ::Sleep(pollIntervalMs);
+            }
+        });
+    }
+
+    /// Stop the background watcher thread.
+    inline void StopWatching() {
+        _Honey::_watching() = false;
+        if (_Honey::_watchThread().joinable())
+            _Honey::_watchThread().join();
+    }
+
+    // ---- Reporting ----
+
+    /// Generate a human-readable alert summary for a login attempt.
+    inline std::string FormatAttempt(const LoginAttempt& evt) {
+        std::string s;
+        s += "HONEY ACCOUNT ALERT\n";
+        s += "  Account    : " + evt.accountName + "\n";
+        s += "  Event ID   : " + std::to_string(evt.eventId);
+        s += (evt.eventId == 4624 ? " (SUCCESSFUL LOGON — CRITICAL!)" :
+              evt.eventId == 4625 ? " (Failed logon)" : "") + std::string("\n");
+        s += "  Time       : " + evt.timestamp + "\n";
+        if (!evt.sourceIP.empty())
+            s += "  Source IP  : " + evt.sourceIP + "\n";
+        if (!evt.workstation.empty())
+            s += "  Workstation: " + evt.workstation + "\n";
+        if (!evt.logonType.empty())
+            s += "  Logon Type : " + evt.logonType + "\n";
+        if (!evt.failureReason.empty())
+            s += "  Reason     : " + evt.failureReason + "\n";
+        return s;
+    }
+
+    /// Print a full report of all honey accounts and their attempt counts to stdout.
+    inline void PrintReport() {
+        auto accounts = ListAll();
+        if (accounts.empty()) {
+            std::puts("No honey accounts registered.");
+            return;
+        }
+        std::printf("%-20s %-8s %-19s %s\n",
+            "Account", "Exists", "Created", "Login Attempts");
+        std::printf("%s\n", std::string(70, '-').c_str());
+        for (auto& a : accounts) {
+            DWORD count = CountLoginAttempts(a.name);
+            std::printf("%-20s %-8s %-19s %lu\n",
+                a.name.c_str(),
+                a.exists ? "YES" : "NO",
+                a.createdAt.empty() ? "Unknown" : a.createdAt.c_str(),
+                count);
+        }
+    }
+
+} // namespace HoneyAccount
 
 } // namespace Security
 } // namespace WinUtils

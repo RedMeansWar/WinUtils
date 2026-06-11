@@ -54,15 +54,10 @@
 #include "wincompat.hpp"
 
 // ---- Windows headers ----
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
+// Note: wincompat.hpp already handles NOMINMAX, UNICODE, STRICT,
+// WIN32_LEAN_AND_MEAN removal, and the winsock2/windows include order.
+// Do NOT re-define WIN32_LEAN_AND_MEAN here — it would strip comdef.h / WMI APIs.
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
-#include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <commdlg.h>
@@ -95,7 +90,6 @@
 #include <algorithm>
 #include <map>
 #include <cmath>
-#include <winsock2.h>
 #include <intrin.h>
 
 // ---- Pragma comments (auto-link) ----
@@ -184,8 +178,8 @@ namespace Internal {
 // ============================================================
 //  SECTION 1 — String Utilities
 // ============================================================
-namespace Str {
 
+namespace Str {
     /// Convert UTF-8 std::string to UTF-16 std::wstring
     inline std::wstring ToWide(const std::string& str) {
         if (str.empty()) return {};
@@ -731,7 +725,7 @@ namespace Mouse {
 
     /// Change the cursor to a standard system cursor
     /// cursorId: IDC_ARROW, IDC_WAIT, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, etc.
-    inline void SetCursorIcon(LPCWSTR cursorId = IDC_ARROW) {
+    inline void SetCursorIcon(LPCWSTR cursorId = reinterpret_cast<LPCWSTR>(IDC_ARROW)) {
         HCURSOR hc = LoadCursorW(nullptr, cursorId);
         SetCursor(hc);
     }
@@ -1958,7 +1952,7 @@ namespace Notify {
         nid.uFlags           = NIF_INFO | NIF_ICON | NIF_TIP;
         nid.dwInfoFlags      = NIIF_INFO;
         nid.uTimeout         = timeoutMs;
-        nid.hIcon            = icon ? icon : LoadIconW(nullptr, IDI_INFORMATION);
+        nid.hIcon            = icon ? icon : LoadIconW(nullptr, reinterpret_cast<LPCWSTR>(IDI_INFORMATION));
         wcsncpy_s(nid.szInfo,     Str::ToWide(text).c_str(),  79);
         wcsncpy_s(nid.szInfoTitle, Str::ToWide(title).c_str(), 63);
         wcsncpy_s(nid.szTip,      Str::ToWide(title).c_str(), 127);
@@ -2353,7 +2347,7 @@ namespace Crypto {
     inline bool HasCLMUL() {
         int cpuInfo[4] = {};
         __cpuid(cpuInfo, 1);
-        // PCLMULQDQ is bit 1 of ECX in CPUID leaf 1
+        // CLMUL is bit 1 of ECX in CPUID leaf 1
         return (cpuInfo[2] & (1 << 1)) != 0;
     }
 
@@ -2433,36 +2427,12 @@ namespace Ini {
 // ============================================================
 //  SECTION 19 — Console Utilities
 // ============================================================
+
 namespace Console {
 
-    /// Set console text color. fg/bg are FOREGROUND_*/BACKGROUND_* constants.
-    inline void SetColor(WORD fg = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
-                         WORD bg = 0) {
-        SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), fg | bg);
-    }
-
-    /// Reset console color to default white on black
-    inline void ResetColor() {
-        SetColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
-    }
-
-    /// Clear the console screen
-    inline void Clear() {
-        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-        CONSOLE_SCREEN_BUFFER_INFO csbi{};
-        GetConsoleScreenBufferInfo(h, &csbi);
-        DWORD size = csbi.dwSize.X * csbi.dwSize.Y;
-        DWORD written = 0;
-        COORD origin = { 0, 0 };
-        FillConsoleOutputCharacterW(h, L' ', size, origin, &written);
-        FillConsoleOutputAttribute(h, csbi.wAttributes, size, origin, &written);
-        SetConsoleCursorPosition(h, origin);
-    }
-
-    /// Set the console window title
-    inline void SetTitle(const std::string& title) {
-        SetConsoleTitleW(Str::ToWide(title).c_str());
-    }
+    // Note: SetColor, ResetColor, Clear, SetTitle are defined in WinConsole.hpp
+    // with full VT/ANSI support. The stubs below are intentionally removed to
+    // avoid redefinition errors when WinConsole.hpp is included.
 
     /// Move the console cursor to (x, y)
     inline void SetCursorPos(SHORT x, SHORT y) {
@@ -2484,13 +2454,6 @@ namespace Console {
         SetConsoleScreenBufferSize(h, size);
         SMALL_RECT rect = { 0, 0, static_cast<SHORT>(cols - 1), static_cast<SHORT>(rows - 1) };
         SetConsoleWindowInfo(h, TRUE, &rect);
-    }
-
-    /// Print colored text then reset
-    inline void PrintColor(const std::string& text, WORD color = FOREGROUND_GREEN | FOREGROUND_INTENSITY) {
-        SetColor(color);
-        std::fputs(text.c_str(), stdout);
-        ResetColor();
     }
 
     /// Print a horizontal rule across the console
@@ -2599,7 +2562,7 @@ namespace Tray {
             nid.uID              = 1;
             nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
             nid.uCallbackMessage = WM_APP + 1;
-            nid.hIcon            = icon ? icon : LoadIconW(nullptr, IDI_APPLICATION);
+            nid.hIcon            = icon ? icon : LoadIconW(nullptr, reinterpret_cast<LPCWSTR>(IDI_APPLICATION));
             wcsncpy_s(nid.szTip, Str::ToWide(tooltip).c_str(), 127);
             created = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
             hMenu   = CreatePopupMenu();

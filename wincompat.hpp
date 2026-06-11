@@ -37,6 +37,21 @@
 
 /*
 ============================================================================
+Windows Event Log API Compatibility Shims (G++ & MSVC Support)
+============================================================================
+Mapping uppercase snake_case macros to the standard Win32 SDK enum values.
+============================================================================
+*/
+#ifndef EVT_QUERY_CHANNEL_PATH
+#define EVT_QUERY_CHANNEL_PATH EvtQueryChannelPath
+#endif
+
+#ifndef EVT_QUERY_REVERSE_DIRECTION
+#define EVT_QUERY_REVERSE_DIRECTION EvtQueryReverseDirection
+#endif
+
+/*
+============================================================================
 Language Standard Enforcement
 ============================================================================
 */
@@ -98,11 +113,10 @@ Compiler Detection
 
 #if defined(_MSC_VER)
 #define WINUTILS_COMPILER_MSVC
-#elif defined(clang)
+#elif defined(__clang__)
 #define WINUTILS_COMPILER_CLANG
-#elif defined(GNUC)
+#elif defined(__GNUC__)
 #define WINUTILS_COMPILER_GCC
-
 #endif
 
 /*
@@ -111,11 +125,11 @@ Architecture Detection
 ============================================================================
 */
 
-#if defined(_M_X64) || defined(x86_64)
+#if defined(_M_X64) || defined(__x86_64__)
 #define WINUTILS_ARCH_X64
-#elif defined(_M_IX86) || defined(i386)
+#elif defined(_M_IX86) || defined(__i386__)
 #define WINUTILS_ARCH_X86
-#elif defined(_M_ARM64) || defined(aarch64)
+#elif defined(_M_ARM64) || defined(__aarch64__)
 #define WINUTILS_ARCH_ARM64
 #endif
 
@@ -144,7 +158,7 @@ Compiler Utility Macros
 #if defined(_MSC_VER)
 #define WINUTILS_FORCEINLINE __forceinline
 #else
-#define WINUTILS_FORCEINLINE inline attribute((always_inline))
+#define WINUTILS_FORCEINLINE inline __attribute__((always_inline))
 #endif
 
 // noexcept abstraction
@@ -159,16 +173,12 @@ Branch Prediction Hints
 ============================================================================
 */
 
-#if defined(GNUC) || defined(clang)
-
-#define WINUTILS_LIKELY(x) __builtin_expect(!!(x), 1)
+#if defined(__GNUC__) || defined(__clang__)
+#define WINUTILS_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define WINUTILS_UNLIKELY(x) __builtin_expect(!!(x), 0)
-
 #else
-
-#define WINUTILS_LIKELY(x) (x)
+#define WINUTILS_LIKELY(x)   (x)
 #define WINUTILS_UNLIKELY(x) (x)
-
 #endif
 
 /*
@@ -209,10 +219,12 @@ Library Version Information
 
 /*
 ============================================================================
-Windows API Includes
+Windows API Includes and Other Needs
 ============================================================================
 */
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 /*
@@ -256,7 +268,22 @@ COM / WMI Compatibility
 */
 
 #ifndef __uuidof
-#define _uuidof(type) IID##type
+#define __uuidof(type) IID_##type
 #endif
+
+/*
+============================================================================
+MinGW SE_*_NAME Compatibility
+============================================================================
+MinGW defines SE_*_NAME constants as narrow const char* literals even when
+UNICODE is defined. The WinUtils _EnablePrivilege() function has a const char*
+overload that widens these automatically, so no change is needed at call sites.
+This comment documents the known MinGW behaviour so future contributors
+understand why both LPCWSTR and const char* overloads exist in WinPower.hpp.
+
+If you add a new call site that uses SE_*_NAME with a Win32W function directly
+(not through _EnablePrivilege), cast it with Str::ToWide(SE_FOO_NAME).c_str().
+============================================================================
+*/
 
 #endif // WINUTILS_COMPAT_HPP
